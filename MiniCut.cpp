@@ -438,11 +438,23 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
             videoOutput.p=nativeVideo.p;videoOutput.p->AddRef();
         }
 
+        ComPtr<IMFMediaType> encoderInput;
+        if(exact){
+            Check(MFCreateMediaType(encoderInput.put()),L"Тип входа видеокодировщика");
+            Check(videoInput->CopyAllItems(encoderInput.get()),L"Параметры видеокодировщика");
+            if(!frameW||!frameH||(frameW&1)||(frameH&1))
+                throw MediaError{MF_E_INVALIDMEDIATYPE,L"Точный экспорт требует чётную ширину и высоту"};
+            // Decoder stride may be aligned to GPU pitch. The new sample is packed.
+            Check(encoderInput->SetUINT32(MF_MT_DEFAULT_STRIDE,frameW),L"Шаг строк NV12");
+            Check(encoderInput->SetUINT32(MF_MT_SAMPLE_SIZE,(UINT32)((UINT64)frameW*frameH*3/2)),
+                  L"Размер упакованного NV12");
+        }
         ComPtr<IMFSinkWriter> writer;
         Check(MFCreateSinkWriterFromURL(output.c_str(),nullptr,nullptr,writer.put()),L"Создание MP4");
         DWORD videoStream=0,audioStream=0;
         Check(writer->AddStream(videoOutput.get(),&videoStream),L"Добавление видео дорожки");
-        Check(writer->SetInputMediaType(videoStream,videoInput.get(),nullptr),L"Настройка видеокодека");
+        Check(writer->SetInputMediaType(videoStream,exact?encoderInput.get():videoInput.get(),nullptr),
+              L"Настройка видеокодека");
         if(mixAudio)ConfigureMixedAAC(writer.get(),audioStream);
         else if(hasAudio){
             Check(writer->AddStream(nativeAudio.get(),&audioStream),L"Добавление аудио дорожки");
