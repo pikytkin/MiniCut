@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <commdlg.h>
+#include <commctrl.h>
 #include <shellapi.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -35,6 +36,7 @@
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "mfplay.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -43,6 +45,7 @@ namespace {
 constexpr LONGLONG HNS = 10000000LL;
 constexpr UINT WM_EXPORT_DONE = WM_APP + 10;
 constexpr UINT WM_EXPORT_PROGRESS = WM_APP + 11;
+constexpr UINT WM_PLAYER_EVENT = WM_APP + 12;
 constexpr int ID_OPEN=100, ID_PLAY=101, ID_SPLIT=102, ID_REMOVE=103,
     ID_TRIM_START=104, ID_TRIM_END=105, ID_UNDO=106, ID_SAVE=107,
     ID_NO_AUDIO=109, ID_LOAD_AUDIO=110;
@@ -97,12 +100,17 @@ std::vector<EditState> g_history;
 LONGLONG g_duration=0,g_audioDuration=0,g_cursor=0,g_dragStart=0,g_dragEnd=0;
 int g_selected=-1,g_selectedAudio=-1,g_previewClip=-1,g_previewAudioClip=-1;
 bool g_playing=false,g_dragging=false,g_exporting=false,g_muteOriginal=false;
+bool g_playerReady=false,g_audioReady=false,g_userWantsPlay=false,g_previewPriming=false;
+ULONGLONG g_primeSince=0;
+LONGLONG g_primeSource=0;
 bool g_clipMouseDown=false,g_clipDragging=false,g_dragAudio=false,g_focusAudio=false,g_rangeSelect=false;
 int g_dragClipIndex=-1,g_insertSlot=0;
 POINT g_mousePt={};
 RECT g_montageTrack={},g_audioTrack={};
 LONGLONG MontageDuration();
 int MontageX(LONGLONG t);
+void UpdatePlayButton();
+void BeginStillPreview();
 
 void Status(const std::wstring& text) { if(g_status) SetWindowTextW(g_status,text.c_str()); }
 void ShowFail(const wchar_t* title, const std::wstring& detail) {
@@ -143,7 +151,16 @@ public:
     }
     void STDMETHODCALLTYPE OnMediaPlayerEvent(MFP_EVENT_HEADER* event) override {
         if(!event||!g_window)return;
-        if(FAILED(event->hrEvent)) PostMessageW(g_window,WM_EXPORT_PROGRESS,1001,(LPARAM)event->hrEvent);
+        if(FAILED(event->hrEvent)){
+            PostMessageW(g_window,WM_EXPORT_PROGRESS,1001,(LPARAM)event->hrEvent);
+            return;
+        }
+        if(event->eEventType==MFP_EVENT_TYPE_MEDIAITEM_SET ||
+           event->eEventType==MFP_EVENT_TYPE_PLAYBACK_ENDED){
+            // MFPlay is asynchronous. Handle readiness on the editor's UI thread.
+            PostMessageW(g_window,WM_PLAYER_EVENT,(WPARAM)event->eEventType,
+                         (LPARAM)event->pMediaPlayer);
+        }
     }
 };
 PlayerCallback* g_callback=nullptr;
@@ -169,14 +186,19 @@ ClipPosition LocateClip(const std::vector<Span>& clips,LONGLONG t){
     return {-1,0,offset};
 }
 void StopAudioPlayer(){
+    g_audioReady=false;
     if(g_audioPlayer){g_audioPlayer->Shutdown();g_audioPlayer->Release();g_audioPlayer=nullptr;}
     g_previewAudioClip=-1;
 }
+void UpdatePlayButton(){
+    if(g_buttons[1])
+        SetWindowTextW(g_buttons[1],g_playing?L"⏸ Пауза":L"▶ Пуск");
+}
 void StopPlayer() {
-    g_playing=false;
+    g_playing=false;g_playerReady=false;g_userWantsPlay=false;g_previewPriming=false;
     StopAudioPlayer();
     if(g_player){g_player->Shutdown();g_player->Release();g_player=nullptr;}
-    g_previewClip=-1;
+    g_previewClip=-1;UpdatePlayButton();
 }
 void SetPlayerPosition(IMFPMediaPlayer* player,LONGLONG time){
     if(!player)return;
@@ -184,15 +206,68 @@ void SetPlayerPosition(IMFPMediaPlayer* player,LONGLONG time){
     pos.vt=VT_I8;pos.hVal.QuadPart=std::max(0LL,time);
     player->SetPosition(MFP_POSITIONTYPE_100NS,&pos);
 }
+void BeginStillPreview(){
+    if(!g_player||!g_playerReady||g_playing)return;
+    ClipPosition clip=LocateClip(g_kept,g_cursor);
+    if(clip.index<0)return;
+    g_primeSource=clip.source;g_primeSince=GetTickCount64();
+    if(g_previewPriming)return;
+    // Render the first frame in a short muted burst. Seeking while stopped
+    // cannot reliably display a video frame in the MFPlay renderer.
+    g_player->SetVolume(0.0f);
+    g_previewPriming=true;
+    if(FAILED(g_player->Play())){
+        g_previewPriming=false;
+        g_player->SetVolume(g_muteOriginal?0.0f:1.0f);
+        Status(L"Не удалось обновить кадр предпросмотра.");
+    }
+}
+void StartPlayback(){
+    if(!g_player){Status(L"Сначала откройте MP4.");return;}
+    if(!g_playerReady){
+        g_userWantsPlay=true;
+        Status(L"Видео загружается. Воспроизведение начнётся автоматически.");
+        return;
+    }
+    if(g_cursor>=MontageDuration())SeekTo(0);
+    if(g_previewPriming){
+        // Already rendering muted preview frames; keep the current playback
+        // running instead of issuing a duplicate asynchronous Play request.
+        g_previewPriming=false;
+    }else if(FAILED(g_player->Play())){
+        Status(L"Плеер ещё готовится к воспроизведению.");
+        g_userWantsPlay=true;return;
+    }
+    g_userWantsPlay=false;g_playing=true;
+    g_player->SetVolume(g_muteOriginal?0.0f:1.0f);
+    ClipPosition audio=LocateClip(g_audioKept,g_cursor);
+    if(g_audioPlayer&&g_audioReady&&audio.index>=0){
+        SetPlayerPosition(g_audioPlayer,audio.source);
+        g_audioPlayer->Play();
+    }
+    UpdatePlayButton();
+}
+void TogglePlayback(){
+    if(!g_player){Status(L"Сначала откройте MP4.");return;}
+    if(g_playing){
+        g_playing=false;g_previewPriming=false;g_userWantsPlay=false;
+        g_player->Pause();
+        if(g_audioPlayer)g_audioPlayer->Pause();
+        UpdatePlayButton();
+    }else StartPlayback();
+}
 void SeekTo(LONGLONG t,bool keepAudioContinuous=false) {
     g_cursor=ClampTime(t,MontageDuration());
     ClipPosition v=LocateClip(g_kept,g_cursor);
     g_previewClip=v.index;
-    if(g_player&&v.index>=0)SetPlayerPosition(g_player,v.source);
+    if(g_player&&g_playerReady&&v.index>=0){
+        SetPlayerPosition(g_player,v.source);
+        if(!g_playing)BeginStillPreview();
+    }
     ClipPosition a=LocateClip(g_audioKept,g_cursor);
     int oldAudioClip=g_previewAudioClip;
     g_previewAudioClip=a.index;
-    if(g_audioPlayer){
+    if(g_audioPlayer&&g_audioReady){
         // Video edits can jump in source time while the imported audio is continuous.
         // Do not seek or restart audio unless the AUDIOTRACK itself has a cut.
         bool audioChanged=!keepAudioContinuous || oldAudioClip!=a.index;
@@ -229,12 +304,13 @@ void OpenFile(const std::wstring& file) {
         g_kept={{0,g_duration}};g_history.clear();g_selected=0;g_selectedAudio=-1;
         g_clipMouseDown=false;g_clipDragging=false;g_dragging=false;g_focusAudio=false;
         if(!g_callback)g_callback=new PlayerCallback();
+        g_playerReady=false;g_userWantsPlay=false;g_previewPriming=false;
         HRESULT hr=MFPCreateMediaPlayer(file.c_str(),FALSE,0,g_callback,g_video,&g_player);
         if(FAILED(hr)){g_player=nullptr;Status(L"Видео загружено, но предпросмотр недоступен");}
         else Status(L"Перетаскивайте клипы мышью. Shift+протяжка — выделить диапазон для удаления.");
         SetWindowTextW(g_window,(L"MiniCut — "+file).c_str());
-        if(g_player)g_player->SetVolume(g_muteOriginal?0.0f:1.0f);
         Relayout();SeekTo(0);InvalidateRect(g_window,nullptr,FALSE);
+        // MEDIAITEM_SET will set the first frame once the item is ready.
     }catch(const MediaError& e){ShowFail(L"Открытие файла",ErrorText(e));}
 }
 void OpenAudioFile(const std::wstring& file){
@@ -251,6 +327,7 @@ void OpenAudioFile(const std::wstring& file){
         PropVariantClear(&duration);
         if(len<=0)throw MediaError{E_INVALIDARG,L"Аудиофайл пуст"};
         StopAudioPlayer();
+        g_audioReady=false;
         g_audioFile=file;g_audioDuration=len;
         // Separate audio timeline starts at zero; extra material beyond the video is ignored.
         g_audioKept={{0,std::min(len,MontageDuration())}};
