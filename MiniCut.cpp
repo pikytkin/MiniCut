@@ -802,6 +802,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         case ID_OPEN:{auto p=FileDialog(false);if(!p.empty())OpenFile(p);break;}
         case ID_LOAD_AUDIO:{auto p=AudioFileDialog();if(!p.empty())OpenAudioFile(p);break;}
         case ID_NO_AUDIO:
+            if(HIWORD(wp)!=BN_CLICKED)break;
             g_muteOriginal=!g_muteOriginal;
             if(g_player)g_player->SetVolume(g_muteOriginal?0.0f:1.0f);
             InvalidateRect(g_noAudio,nullptr,TRUE);
