@@ -1,0 +1,31 @@
+name: Build MiniCut for Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "MiniCut.cpp"
+      - ".github/workflows/build.yml"
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Compile MiniCut.exe
+        shell: cmd
+        run: cl /nologo /EHsc /std:c++20 /O2 /W3 MiniCut.cpp /Fe:MiniCut.exe /link /SUBSYSTEM:WINDOWS
+
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: MiniCut-Windows
+          path: MiniCut.exe
+          if-no-files-found: error
