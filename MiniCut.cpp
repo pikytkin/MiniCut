@@ -41,7 +41,8 @@ constexpr LONGLONG HNS = 10000000LL;
 constexpr UINT WM_EXPORT_DONE = WM_APP + 10;
 constexpr UINT WM_EXPORT_PROGRESS = WM_APP + 11;
 constexpr int ID_OPEN=100, ID_PLAY=101, ID_SPLIT=102, ID_REMOVE=103,
-    ID_TRIM_START=104, ID_TRIM_END=105, ID_UNDO=106, ID_FAST=107, ID_EXACT=108;
+    ID_TRIM_START=104, ID_TRIM_END=105, ID_UNDO=106, ID_FAST=107, ID_EXACT=108,
+    ID_NO_AUDIO=109;
 
 template <typename T> struct ComPtr {
     T* p = nullptr;
@@ -74,7 +75,7 @@ std::wstring TimeLabel(LONGLONG t) {
     return b;
 }
 
-HWND g_window=nullptr,g_video=nullptr,g_status=nullptr,g_time=nullptr;
+HWND g_window=nullptr,g_video=nullptr,g_status=nullptr,g_time=nullptr,g_noAudio=nullptr;
 HWND g_buttons[9]={};
 HFONT g_font=nullptr;
 IMFPMediaPlayer* g_player=nullptr;
@@ -84,17 +85,20 @@ std::vector<std::vector<Span>> g_history;
 LONGLONG g_duration=0,g_cursor=0,g_dragStart=0,g_dragEnd=0;
 int g_selected=-1;
 bool g_playing=false,g_mouseDown=false,g_dragging=false,g_exporting=false;
+bool g_clipMouseDown=false,g_clipDragging=false;
+int g_dragClipIndex=-1,g_insertSlot=0;
 POINT g_mousePt={};
-RECT g_track={};
+RECT g_track={},g_montageTrack={};
 
 void Status(const std::wstring& text) { if(g_status) SetWindowTextW(g_status,text.c_str()); }
 void ShowFail(const wchar_t* title, const std::wstring& detail) {
     MessageBoxW(g_window,detail.c_str(),title,MB_OK|MB_ICONERROR);
 }
-void RedrawTrack() { if(g_window) InvalidateRect(g_window,&g_track,FALSE); }
+void RedrawTrack() { if(g_window){InvalidateRect(g_window,&g_track,FALSE);InvalidateRect(g_window,&g_montageTrack,FALSE);} }
 void SetUIBusy(bool busy) {
     g_exporting=busy;
     for(auto& b:g_buttons) if(b) EnableWindow(b,!busy);
+    if(g_noAudio)EnableWindow(g_noAudio,!busy);
 }
 
 class PlayerCallback final:public IMFPMediaPlayerCallback {
@@ -156,10 +160,11 @@ void OpenFile(const std::wstring& file) {
         StopPlayer();
         g_file=file;g_duration=newDuration;g_cursor=0;
         g_kept={{0,g_duration}};g_history.clear();g_selected=0;
+        g_mouseDown=false;g_clipMouseDown=false;g_clipDragging=false;g_dragging=false;
         if(!g_callback)g_callback=new PlayerCallback();
         HRESULT hr=MFPCreateMediaPlayer(file.c_str(),FALSE,0,g_callback,g_video,&g_player);
         if(FAILED(hr)) {g_player=nullptr;Status(L"Видео загружено, но предпросмотр недоступен");}
-        else Status(L"Файл загружен. Щёлкните на шкале для перемещения, тяните мышь для выделения участка.");
+        else Status(L"Шкала «Исходник» — разрез и выделение; части на дорожке «Монтаж» можно перетаскивать.");
         SetWindowTextW(g_window,(L"MiniCut — "+file).c_str());
         SeekTo(0);
         InvalidateRect(g_window,nullptr,FALSE);
@@ -253,7 +258,7 @@ void CopyAttribute(IMFAttributes* from,IMFAttributes* to,const GUID& guid) {
 // Audio start/end precision in EXACT remains limited to individual AAC packets.
 struct ExportResult {bool ok=false;std::wstring message;};
 void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<Span> spans,
-                 LONGLONG duration,bool exact){
+                 LONGLONG duration,bool exact,bool muteAudio){
     ExportResult* result=new ExportResult();
     HRESULT co=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
     bool coOk=SUCCEEDED(co);
@@ -269,7 +274,8 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
         if(!exact&&videoSubtype!=MFVideoFormat_H264)
             throw MediaError{MF_E_INVALIDMEDIATYPE,L"Быстрый экспорт поддерживает только H.264"};
 
-        bool hasAudio=SUCCEEDED(reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM,0,nativeAudio.put()));
+        bool hasAudio=!muteAudio &&
+            SUCCEEDED(reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM,0,nativeAudio.put()));
         if(hasAudio){
             GUID audioSubtype={};
             if(FAILED(nativeAudio->GetGUID(MF_MT_SUBTYPE,&audioSubtype))||audioSubtype!=MFAudioFormat_AAC)
@@ -354,6 +360,7 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
                     }
                 }
                 if(!isVideo&&!isAudio)continue;
+                if(isAudio&&!hasAudio)continue;
                 if(t>=part.last){if(isVideo)videoEnd=true;else audioEnd=true;continue;}
                 if(t<part.first||!sample)continue;
                 if((isVideo&&videoEnd)||(isAudio&&audioEnd))continue;
@@ -377,8 +384,9 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
         }
         Check(writer->Finalize(),L"Завершение MP4");
         result->ok=true;
-        result->message=exact?L"Точный экспорт завершён. Видео перекодировано в H.264, звук AAC сохранён без перекодирования.":
-            L"Быстрый экспорт завершён. Потоки сохранены без перекодирования (границы по ключевым кадрам).";
+        result->message=muteAudio ?
+            (exact?L"Точный экспорт завершён. Видео H.264 без звуковой дорожки.":L"Быстрый экспорт завершён. Видео без звука (по ключевым кадрам).") :
+            (exact?L"Точный экспорт завершён. Видео H.264, звук AAC сохранён.":L"Быстрый экспорт завершён. Потоки сохранены без перекодирования (границы по ключевым кадрам).");
     }catch(const MediaError& e){result->message=ErrorText(e);}
     catch(...){result->message=L"Неизвестная ошибка экспорта";}
     if(!result->ok)DeleteFileW(output.c_str());
@@ -407,10 +415,11 @@ void StartExport(bool exact){
     if(_wcsicmp(output.c_str(),g_file.c_str())==0){
         ShowFail(L"Сохранение",L"Нельзя перезаписывать исходное видео. Выберите другой файл.");return;
     }
+    bool muteAudio=g_noAudio && SendMessageW(g_noAudio,BM_GETCHECK,0,0)==BST_CHECKED;
     SetUIBusy(true);
     Status(exact?L"Точный экспорт: кодирование кадр за кадром…":L"Быстрый экспорт: поиск ключевых кадров…");
-    std::thread([win=g_window,src=g_file,dst=output,parts=g_kept,len=g_duration,exact](){
-        ExportVideo(win,src,dst,parts,len,exact);
+    std::thread([win=g_window,src=g_file,dst=output,parts=g_kept,len=g_duration,exact,muteAudio](){
+        ExportVideo(win,src,dst,parts,len,exact,muteAudio);
     }).detach();
 }
 
@@ -475,7 +484,8 @@ void Relayout(){
     g_track=TrackRect();
     if(g_buttons[7])MoveWindow(g_buttons[7],w-302,h-51,138,34,TRUE);
     if(g_buttons[8])MoveWindow(g_buttons[8],w-154,h-51,134,34,TRUE);
-    if(g_status)MoveWindow(g_status,20,h-46,w-333,30,TRUE);
+    if(g_noAudio)MoveWindow(g_noAudio,20,h-51,194,34,TRUE);
+    if(g_status)MoveWindow(g_status,222,h-46,std::max(60,w-555),30,TRUE);
     RedrawTrack();
 }
 HWND MakeButton(int idx,int id,const wchar_t* caption){
@@ -499,6 +509,10 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         MakeButton(4,ID_TRIM_START,L"Убрать до курсора");
         MakeButton(5,ID_TRIM_END,L"Убрать после");MakeButton(6,ID_UNDO,L"↶ Отмена");
         MakeButton(7,ID_FAST,L"⚡ Быстро");MakeButton(8,ID_EXACT,L"◎ Точно");
+        g_noAudio=CreateWindowW(L"BUTTON",L"Экспорт без звука",
+            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,0,0,194,32,
+            hwnd,(HMENU)(INT_PTR)ID_NO_AUDIO,GetModuleHandleW(nullptr),nullptr);
+        SendMessageW(g_noAudio,WM_SETFONT,(WPARAM)g_font,TRUE);
         g_time=CreateWindowW(L"STATIC",L"00:00:00 / 00:00:00",WS_CHILD|WS_VISIBLE,0,0,100,20,hwnd,nullptr,nullptr,nullptr);
         g_status=CreateWindowW(L"STATIC",L"Откройте MP4. Можно перетащить файл в окно.",WS_CHILD|WS_VISIBLE|SS_LEFT,0,0,100,20,hwnd,nullptr,nullptr,nullptr);
         SendMessageW(g_time,WM_SETFONT,(WPARAM)g_font,TRUE);
