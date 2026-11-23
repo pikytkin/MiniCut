@@ -339,13 +339,14 @@ void CopyAttribute(IMFAttributes* from,IMFAttributes* to,const GUID& guid) {
     if(SUCCEEDED(from->GetItem(guid,&p))) {to->SetItem(guid,p);PropVariantClear(&p);}
 }
 
-// Two distinct paths:
-// FAST: source compressed H264+AAC -> sink identical compressed formats (remux).
-// EXACT: source decodes video to NV12 -> Windows H264 encoder; audio is copied AAC.
-// Audio start/end precision in EXACT remains limited to individual AAC packets.
+#include "MiniCutAudio.h"
+// FAST remuxes H.264; EXACT decodes video to RGB32 before encoding.
+// Imported audio is mixed with original audio in PCM and encoded to AAC.
+
 struct ExportResult {bool ok=false;std::wstring message;};
 void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<Span> spans,
-                 LONGLONG duration,bool exact,bool muteAudio){
+                 LONGLONG duration,bool exact,bool muteAudio,
+                 std::wstring externalAudio,std::vector<Span> audioSpans){
     ExportResult* result=new ExportResult();
     HRESULT co=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
     bool coOk=SUCCEEDED(co);
@@ -353,7 +354,13 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
     try {
         Check(MFStartup(MF_VERSION),L"Инициализация Media Foundation"); mfOk=true;
         ComPtr<IMFSourceReader> reader;
-        Check(MFCreateSourceReaderFromURL(input.c_str(),nullptr,reader.put()),L"Открытие исходного файла");
+        ComPtr<IMFAttributes> readerAttrs;
+        if(exact){
+            Check(MFCreateAttributes(readerAttrs.put(),2),L"Настройки видеодекодера");
+            Check(readerAttrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,TRUE),
+                  L"Цветовое преобразование кадров");
+        }
+        Check(MFCreateSourceReaderFromURL(input.c_str(),readerAttrs.get(),reader.put()),L"Открытие исходного файла");
         ComPtr<IMFMediaType> nativeVideo,nativeAudio;
         Check(reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,0,nativeVideo.put()),L"Видео дорожка не найдена");
         GUID videoSubtype={};
@@ -361,7 +368,8 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
         if(!exact&&videoSubtype!=MFVideoFormat_H264)
             throw MediaError{MF_E_INVALIDMEDIATYPE,L"Быстрый экспорт поддерживает только H.264"};
 
-        bool hasAudio=!muteAudio &&
+        bool mixAudio=!externalAudio.empty();
+        bool hasAudio=!muteAudio && !mixAudio &&
             SUCCEEDED(reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM,0,nativeAudio.put()));
         if(hasAudio){
             GUID audioSubtype={};
@@ -388,16 +396,20 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
         if(exact){
             Check(MFCreateMediaType(videoInput.put()),L"Формат декодирования");
             Check(videoInput->SetGUID(MF_MT_MAJOR_TYPE,MFMediaType_Video),L"Видео тип");
-            Check(videoInput->SetGUID(MF_MT_SUBTYPE,MFVideoFormat_NV12),L"NV12");
-            Check(reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,nullptr,videoInput.get()),L"Декодирование видео в NV12");
+            Check(videoInput->SetGUID(MF_MT_SUBTYPE,MFVideoFormat_RGB32),L"RGB32");
+            Check(reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,nullptr,videoInput.get()),L"Цветовое преобразование видео в RGB32");
             videoInput.reset();
-            Check(reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,videoInput.put()),L"Получение параметров NV12");
+            Check(reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,videoInput.put()),L"Получение параметров RGB32");
             Check(MFCreateMediaType(videoOutput.put()),L"Формат H.264");
             Check(videoOutput->SetGUID(MF_MT_MAJOR_TYPE,MFMediaType_Video),L"Видео тип H.264");
             Check(videoOutput->SetGUID(MF_MT_SUBTYPE,MFVideoFormat_H264),L"Видеокодек H.264");
             CopyAttribute(nativeVideo.get(),videoOutput.get(),MF_MT_FRAME_SIZE);
             CopyAttribute(nativeVideo.get(),videoOutput.get(),MF_MT_FRAME_RATE);
             CopyAttribute(nativeVideo.get(),videoOutput.get(),MF_MT_PIXEL_ASPECT_RATIO);
+            CopyAttribute(nativeVideo.get(),videoOutput.get(),MF_MT_VIDEO_PRIMARIES);
+            CopyAttribute(nativeVideo.get(),videoOutput.get(),MF_MT_TRANSFER_FUNCTION);
+            CopyAttribute(nativeVideo.get(),videoOutput.get(),MF_MT_YUV_MATRIX);
+            CopyAttribute(nativeVideo.get(),videoOutput.get(),MF_MT_VIDEO_NOMINAL_RANGE);
             videoOutput->SetUINT32(MF_MT_INTERLACE_MODE,MFVideoInterlace_Progressive);
             UINT32 bitrate=4000000;
             nativeVideo->GetUINT32(MF_MT_AVG_BITRATE,&bitrate);
@@ -413,14 +425,24 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
         DWORD videoStream=0,audioStream=0;
         Check(writer->AddStream(videoOutput.get(),&videoStream),L"Добавление видео дорожки");
         Check(writer->SetInputMediaType(videoStream,videoInput.get(),nullptr),L"Настройка видеокодека");
-        if(hasAudio){
+        if(mixAudio)ConfigureMixedAAC(writer.get(),audioStream);
+        else if(hasAudio){
             Check(writer->AddStream(nativeAudio.get(),&audioStream),L"Добавление аудио дорожки");
             Check(writer->SetInputMediaType(audioStream,nativeAudio.get(),nullptr),L"Настройка AAC");
         }
-        Check(writer->BeginWriting(),L"Начало записи MP4");
         LONGLONG total=0;
         for(auto s:spans)total+=s.last-s.first;
         if(total<=0)throw MediaError{E_INVALIDARG,L"Нет фрагментов для сохранения"};
+        std::vector<int32_t> mixedPCM;
+        if(mixAudio){
+            const LONGLONG frames=AudioFrames(total);
+            if(frames>(LONGLONG)MIX_RATE*60*30)
+                throw MediaError{E_OUTOFMEMORY,L"Смешивание аудио ограничено 30 минутами"};
+            mixedPCM.resize((size_t)frames*MIX_CHANNELS,0);
+            if(!muteAudio && FileHasAudio(input))MixSourcePCM(input,spans,mixedPCM);
+            MixSourcePCM(externalAudio,audioSpans,mixedPCM);
+        }
+        Check(writer->BeginWriting(),L"Начало записи MP4");
         LONGLONG offset=0;
         int lastPct=-1;
         for(const Span& part:spans){
@@ -457,7 +479,7 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
                 if(SUCCEEDED(sample->GetSampleDuration(&sampleLength))&&sampleLength>0 && t+sampleLength>part.last)
                     sample->SetSampleDuration(part.last-t);
                 UINT64 decode=0;
-                if(SUCCEEDED(sample->GetUINT64(MFSampleExtension_DecodeTimestamp,&decode))){
+                if(!exact && SUCCEEDED(sample->GetUINT64(MFSampleExtension_DecodeTimestamp,&decode))){
                     const LONGLONG adjusted=offset+((LONGLONG)decode-part.first);
                     if(adjusted>=0)sample->SetUINT64(MFSampleExtension_DecodeTimestamp,(UINT64)adjusted);
                 }
@@ -469,11 +491,14 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
             }
             offset+=part.last-part.first;
         }
+        if(mixAudio)WriteMixedAudio(writer.get(),audioStream,mixedPCM);
         Check(writer->Finalize(),L"Завершение MP4");
         result->ok=true;
-        result->message=muteAudio ?
-            (exact?L"Точный экспорт завершён. Видео H.264 без звуковой дорожки.":L"Быстрый экспорт завершён. Видео без звука (по ключевым кадрам).") :
-            (exact?L"Точный экспорт завершён. Видео H.264, звук AAC сохранён.":L"Быстрый экспорт завершён. Потоки сохранены без перекодирования (границы по ключевым кадрам).");
+        result->message=mixAudio?
+            L"Готово. Видео и монтажная аудиодорожка сохранены в MP4 (AAC).":
+            (muteAudio?L"Готово. Оригинальный звук отключён.":
+            (exact?L"Точный экспорт завершён. Видео H.264, звук AAC сохранён.":
+                   L"Быстрый экспорт завершён. Потоки сохранены без перекодирования."));
     }catch(const MediaError& e){result->message=ErrorText(e);}
     catch(...){result->message=L"Неизвестная ошибка экспорта";}
     if(!result->ok)DeleteFileW(output.c_str());
@@ -502,11 +527,12 @@ void StartExport(bool exact){
     if(_wcsicmp(output.c_str(),g_file.c_str())==0){
         ShowFail(L"Сохранение",L"Нельзя перезаписывать исходное видео. Выберите другой файл.");return;
     }
-    bool muteAudio=g_noAudio && SendMessageW(g_noAudio,BM_GETCHECK,0,0)==BST_CHECKED;
+    bool muteAudio=g_muteOriginal;
     SetUIBusy(true);
     Status(exact?L"Точный экспорт: кодирование кадр за кадром…":L"Быстрый экспорт: поиск ключевых кадров…");
-    std::thread([win=g_window,src=g_file,dst=output,parts=g_kept,len=g_duration,exact,muteAudio](){
-        ExportVideo(win,src,dst,parts,len,exact,muteAudio);
+    std::thread([win=g_window,src=g_file,dst=output,parts=g_kept,len=g_duration,exact,muteAudio,
+                 audio=g_audioFile,audioParts=g_audioKept](){
+        ExportVideo(win,src,dst,parts,len,exact,muteAudio,audio,audioParts);
     }).detach();
 }
 
