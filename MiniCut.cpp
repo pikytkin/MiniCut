@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <commdlg.h>
+#include <commctrl.h>
 #include <shellapi.h>
 #include <mfapi.h>
 #include <mfidl.h>
@@ -35,6 +36,7 @@
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "mfplay.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
@@ -43,8 +45,9 @@ namespace {
 constexpr LONGLONG HNS = 10000000LL;
 constexpr UINT WM_EXPORT_DONE = WM_APP + 10;
 constexpr UINT WM_EXPORT_PROGRESS = WM_APP + 11;
+constexpr UINT WM_PLAYER_EVENT = WM_APP + 12;
 constexpr int ID_OPEN=100, ID_PLAY=101, ID_SPLIT=102, ID_REMOVE=103,
-    ID_TRIM_START=104, ID_TRIM_END=105, ID_UNDO=106, ID_FAST=107, ID_EXACT=108,
+    ID_TRIM_START=104, ID_TRIM_END=105, ID_UNDO=106, ID_SAVE=107,
     ID_NO_AUDIO=109, ID_LOAD_AUDIO=110;
 
 template <typename T> struct ComPtr {
@@ -79,7 +82,7 @@ std::wstring TimeLabel(LONGLONG t) {
 }
 
 HWND g_window=nullptr,g_video=nullptr,g_status=nullptr,g_time=nullptr,g_noAudio=nullptr,g_loadAudio=nullptr;
-HWND g_buttons[9]={};
+HWND g_buttons[8]={};
 UINT32 g_previewWidth=0,g_previewHeight=0;
 int g_spinnerStep=0,g_exportPercent=-1;
 void Relayout();
@@ -97,12 +100,18 @@ std::vector<EditState> g_history;
 LONGLONG g_duration=0,g_audioDuration=0,g_cursor=0,g_dragStart=0,g_dragEnd=0;
 int g_selected=-1,g_selectedAudio=-1,g_previewClip=-1,g_previewAudioClip=-1;
 bool g_playing=false,g_dragging=false,g_exporting=false,g_muteOriginal=false;
+bool g_playerReady=false,g_audioReady=false,g_userWantsPlay=false,g_previewPriming=false;
+ULONGLONG g_primeSince=0;
+LONGLONG g_primeSource=0;
 bool g_clipMouseDown=false,g_clipDragging=false,g_dragAudio=false,g_focusAudio=false,g_rangeSelect=false;
 int g_dragClipIndex=-1,g_insertSlot=0;
 POINT g_mousePt={};
 RECT g_montageTrack={},g_audioTrack={};
 LONGLONG MontageDuration();
 int MontageX(LONGLONG t);
+void SeekTo(LONGLONG t,bool keepAudioContinuous=false);
+void UpdatePlayButton();
+void BeginStillPreview();
 
 void Status(const std::wstring& text) { if(g_status) SetWindowTextW(g_status,text.c_str()); }
 void ShowFail(const wchar_t* title, const std::wstring& detail) {
@@ -143,7 +152,16 @@ public:
     }
     void STDMETHODCALLTYPE OnMediaPlayerEvent(MFP_EVENT_HEADER* event) override {
         if(!event||!g_window)return;
-        if(FAILED(event->hrEvent)) PostMessageW(g_window,WM_EXPORT_PROGRESS,1001,(LPARAM)event->hrEvent);
+        if(FAILED(event->hrEvent)){
+            PostMessageW(g_window,WM_EXPORT_PROGRESS,1001,(LPARAM)event->hrEvent);
+            return;
+        }
+        if(event->eEventType==MFP_EVENT_TYPE_MEDIAITEM_SET ||
+           event->eEventType==MFP_EVENT_TYPE_PLAYBACK_ENDED){
+            // MFPlay is asynchronous. Handle readiness on the editor's UI thread.
+            PostMessageW(g_window,WM_PLAYER_EVENT,(WPARAM)event->eEventType,
+                         (LPARAM)event->pMediaPlayer);
+        }
     }
 };
 PlayerCallback* g_callback=nullptr;
@@ -169,14 +187,19 @@ ClipPosition LocateClip(const std::vector<Span>& clips,LONGLONG t){
     return {-1,0,offset};
 }
 void StopAudioPlayer(){
+    g_audioReady=false;
     if(g_audioPlayer){g_audioPlayer->Shutdown();g_audioPlayer->Release();g_audioPlayer=nullptr;}
     g_previewAudioClip=-1;
 }
+void UpdatePlayButton(){
+    if(g_buttons[1])
+        SetWindowTextW(g_buttons[1],g_playing?L"⏸ Пауза":L"▶ Пуск");
+}
 void StopPlayer() {
-    g_playing=false;
+    g_playing=false;g_playerReady=false;g_userWantsPlay=false;g_previewPriming=false;
     StopAudioPlayer();
     if(g_player){g_player->Shutdown();g_player->Release();g_player=nullptr;}
-    g_previewClip=-1;
+    g_previewClip=-1;UpdatePlayButton();
 }
 void SetPlayerPosition(IMFPMediaPlayer* player,LONGLONG time){
     if(!player)return;
@@ -184,15 +207,68 @@ void SetPlayerPosition(IMFPMediaPlayer* player,LONGLONG time){
     pos.vt=VT_I8;pos.hVal.QuadPart=std::max(0LL,time);
     player->SetPosition(MFP_POSITIONTYPE_100NS,&pos);
 }
-void SeekTo(LONGLONG t,bool keepAudioContinuous=false) {
+void BeginStillPreview(){
+    if(!g_player||!g_playerReady||g_playing)return;
+    ClipPosition clip=LocateClip(g_kept,g_cursor);
+    if(clip.index<0)return;
+    g_primeSource=clip.source;g_primeSince=GetTickCount64();
+    if(g_previewPriming)return;
+    // Render the first frame in a short muted burst. Seeking while stopped
+    // cannot reliably display a video frame in the MFPlay renderer.
+    g_player->SetVolume(0.0f);
+    g_previewPriming=true;
+    if(FAILED(g_player->Play())){
+        g_previewPriming=false;
+        g_player->SetVolume(g_muteOriginal?0.0f:1.0f);
+        Status(L"Не удалось обновить кадр предпросмотра.");
+    }
+}
+void StartPlayback(){
+    if(!g_player){Status(L"Сначала откройте MP4.");return;}
+    if(!g_playerReady){
+        g_userWantsPlay=true;
+        Status(L"Видео загружается. Воспроизведение начнётся автоматически.");
+        return;
+    }
+    if(g_cursor>=MontageDuration())SeekTo(0);
+    if(g_previewPriming){
+        // Already rendering muted preview frames; keep the current playback
+        // running instead of issuing a duplicate asynchronous Play request.
+        g_previewPriming=false;
+    }else if(FAILED(g_player->Play())){
+        Status(L"Плеер ещё готовится к воспроизведению.");
+        g_userWantsPlay=true;return;
+    }
+    g_userWantsPlay=false;g_playing=true;
+    g_player->SetVolume(g_muteOriginal?0.0f:1.0f);
+    ClipPosition audio=LocateClip(g_audioKept,g_cursor);
+    if(g_audioPlayer&&g_audioReady&&audio.index>=0){
+        SetPlayerPosition(g_audioPlayer,audio.source);
+        g_audioPlayer->Play();
+    }
+    UpdatePlayButton();
+}
+void TogglePlayback(){
+    if(!g_player){Status(L"Сначала откройте MP4.");return;}
+    if(g_playing){
+        g_playing=false;g_previewPriming=false;g_userWantsPlay=false;
+        g_player->Pause();
+        if(g_audioPlayer)g_audioPlayer->Pause();
+        UpdatePlayButton();
+    }else StartPlayback();
+}
+void SeekTo(LONGLONG t,bool keepAudioContinuous) {
     g_cursor=ClampTime(t,MontageDuration());
     ClipPosition v=LocateClip(g_kept,g_cursor);
     g_previewClip=v.index;
-    if(g_player&&v.index>=0)SetPlayerPosition(g_player,v.source);
+    if(g_player&&g_playerReady&&v.index>=0){
+        SetPlayerPosition(g_player,v.source);
+        if(!g_playing)BeginStillPreview();
+    }
     ClipPosition a=LocateClip(g_audioKept,g_cursor);
     int oldAudioClip=g_previewAudioClip;
     g_previewAudioClip=a.index;
-    if(g_audioPlayer){
+    if(g_audioPlayer&&g_audioReady){
         // Video edits can jump in source time while the imported audio is continuous.
         // Do not seek or restart audio unless the AUDIOTRACK itself has a cut.
         bool audioChanged=!keepAudioContinuous || oldAudioClip!=a.index;
@@ -229,12 +305,13 @@ void OpenFile(const std::wstring& file) {
         g_kept={{0,g_duration}};g_history.clear();g_selected=0;g_selectedAudio=-1;
         g_clipMouseDown=false;g_clipDragging=false;g_dragging=false;g_focusAudio=false;
         if(!g_callback)g_callback=new PlayerCallback();
+        g_playerReady=false;g_userWantsPlay=false;g_previewPriming=false;
         HRESULT hr=MFPCreateMediaPlayer(file.c_str(),FALSE,0,g_callback,g_video,&g_player);
         if(FAILED(hr)){g_player=nullptr;Status(L"Видео загружено, но предпросмотр недоступен");}
         else Status(L"Перетаскивайте клипы мышью. Shift+протяжка — выделить диапазон для удаления.");
         SetWindowTextW(g_window,(L"MiniCut — "+file).c_str());
-        if(g_player)g_player->SetVolume(g_muteOriginal?0.0f:1.0f);
         Relayout();SeekTo(0);InvalidateRect(g_window,nullptr,FALSE);
+        // MEDIAITEM_SET will set the first frame once the item is ready.
     }catch(const MediaError& e){ShowFail(L"Открытие файла",ErrorText(e));}
 }
 void OpenAudioFile(const std::wstring& file){
@@ -251,6 +328,7 @@ void OpenAudioFile(const std::wstring& file){
         PropVariantClear(&duration);
         if(len<=0)throw MediaError{E_INVALIDARG,L"Аудиофайл пуст"};
         StopAudioPlayer();
+        g_audioReady=false;
         g_audioFile=file;g_audioDuration=len;
         // Separate audio timeline starts at zero; extra material beyond the video is ignored.
         g_audioKept={{0,std::min(len,MontageDuration())}};
@@ -316,10 +394,13 @@ void RemoveSelected(){
         Remember();parts.erase(parts.begin()+selected);
         NormalizeSelection();SeekTo(std::min(g_cursor,MontageDuration()));
         Status(g_focusAudio?L"Аудиофрагмент удалён. Ctrl+Z — отмена.":L"Видеофрагмент удалён. Ctrl+Z — отмена.");
+    }else{
+        Status(L"Сначала выделите фрагмент на видео- или аудиодорожке.");
     }
 }
 void Undo(){
-    if(g_history.empty()||g_exporting)return;
+    if(g_exporting)return;
+    if(g_history.empty()){Status(L"Нет действий для отмены.");return;}
     EditState x=std::move(g_history.back());g_history.pop_back();
     g_kept=std::move(x.video);g_audioKept=std::move(x.audio);
     g_selected=x.videoSelected;g_selectedAudio=x.audioSelected;g_focusAudio=x.focusAudio;
@@ -536,11 +617,7 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
         if(mixAudio)WriteMixedAudioUntil(writer.get(),audioStream,mixedPCM,audioWritten,total);
         Check(writer->Finalize(),L"Завершение MP4");
         result->ok=true;
-        result->message=mixAudio?
-            L"Готово. Видео и монтажная аудиодорожка сохранены в MP4 (AAC).":
-            (muteAudio?L"Готово. Оригинальный звук отключён.":
-            (exact?L"Точный экспорт завершён. Видео H.264, звук AAC сохранён.":
-                   L"Быстрый экспорт завершён. Потоки сохранены без перекодирования."));
+        result->message=L"Сохранение выполнено успешно.";
     }catch(const MediaError& e){result->message=ErrorText(e);}
     catch(...){result->message=L"Неизвестная ошибка экспорта";}
     if(!result->ok)DeleteFileW(output.c_str());
@@ -572,7 +649,7 @@ void StartExport(bool exact){
     bool muteAudio=g_muteOriginal;
     SetUIBusy(true);
     g_spinnerStep=0;g_exportPercent=0;
-    Status(exact?L"Точный экспорт: кодирование кадр за кадром…":L"Быстрый экспорт: поиск ключевых кадров…");
+    Status(L"Сохранение видео…");
     std::thread([win=g_window,src=g_file,dst=output,parts=g_kept,len=g_duration,exact,muteAudio,
                  audio=g_audioFile,audioParts=g_audioKept](){
         ExportVideo(win,src,dst,parts,len,exact,muteAudio,audio,audioParts);
@@ -732,9 +809,8 @@ void Relayout(){
     if(g_noAudio)MoveWindow(g_noAudio,w-319,h-246,300,37,TRUE);
     g_montageTrack=MontageTrackRect();
     g_audioTrack=AudioTrackRect();
-    if(g_buttons[7])MoveWindow(g_buttons[7],w-311,h-57,138,36,TRUE);
-    if(g_buttons[8])MoveWindow(g_buttons[8],w-164,h-57,145,36,TRUE);
-    if(g_status)MoveWindow(g_status,18,h-53,std::max(100,w-345),31,TRUE);
+    if(g_buttons[7])MoveWindow(g_buttons[7],w-174,h-57,155,36,TRUE);
+    if(g_status)MoveWindow(g_status,18,h-53,std::max(100,w-212),31,TRUE);
     InvalidateRect(g_window,nullptr,FALSE);
 }
 HWND MakeButton(int idx,int id,const wchar_t* caption){
@@ -762,7 +838,7 @@ void DrawExportSpinner(HDC dc){
     RECT area=SpinnerRect();
     SetBkMode(dc,TRANSPARENT);
     SetTextColor(dc,RGB(232,239,247));
-    std::wstring caption=L"Экспорт: "+(g_exportPercent>=0
+    std::wstring caption=L"Сохранение: "+(g_exportPercent>=0
         ?std::to_wstring(g_exportPercent)+L"%":std::wstring(L"подготовка"));
     RECT label={area.left,area.top,area.right-49,area.bottom};
     DrawTextW(dc,caption.c_str(),-1,&label,DT_SINGLELINE|DT_RIGHT|DT_VCENTER);
@@ -780,6 +856,32 @@ void DrawExportSpinner(HDC dc){
         SelectObject(dc,old);DeleteObject(dot);
     }
 }
+// MFPlay paints its own child video window. The default STATIC control paint
+// can overwrite the frame, and MFPlay needs UpdateVideo after resize/repaint.
+LRESULT CALLBACK VideoWindowSubclass(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp,
+                                      UINT_PTR subclassId,DWORD_PTR){
+    if(msg==WM_PAINT){
+        PAINTSTRUCT ps;HDC dc=BeginPaint(hwnd,&ps);
+        if(g_player && g_playerReady){
+            g_player->UpdateVideo();
+        }else{
+            RECT r;GetClientRect(hwnd,&r);
+            HBRUSH bg=CreateSolidBrush(RGB(30,33,40));
+            FillRect(dc,&r,bg);DeleteObject(bg);
+        }
+        EndPaint(hwnd,&ps);
+        return 0;
+    }
+    if(msg==WM_SIZE){
+        LRESULT result=DefSubclassProc(hwnd,msg,wp,lp);
+        if(g_player && g_playerReady)g_player->UpdateVideo();
+        return result;
+    }
+    if(msg==WM_ERASEBKGND)return TRUE;
+    if(msg==WM_NCDESTROY)RemoveWindowSubclass(hwnd,VideoWindowSubclass,subclassId);
+    return DefSubclassProc(hwnd,msg,wp,lp);
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     switch(msg){
     case WM_CREATE:{
@@ -787,13 +889,14 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         DragAcceptFiles(hwnd,TRUE);
         g_font=CreateFontW(-16,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
-        g_video=CreateWindowExW(WS_EX_CLIENTEDGE,L"STATIC",L"Откройте видео",
+        g_video=CreateWindowExW(WS_EX_CLIENTEDGE,L"STATIC",L"",
             WS_CHILD|WS_VISIBLE|SS_BLACKRECT,0,0,100,100,hwnd,nullptr,GetModuleHandleW(nullptr),nullptr);
+        if(g_video)SetWindowSubclass(g_video,VideoWindowSubclass,1,0);
         MakeButton(0,ID_OPEN,L"Открыть MP4");MakeButton(1,ID_PLAY,L"▶ / Пауза");
         MakeButton(2,ID_SPLIT,L"✂ Разрезать");MakeButton(3,ID_REMOVE,L"Удалить");
         MakeButton(4,ID_TRIM_START,L"Убрать до курсора");
         MakeButton(5,ID_TRIM_END,L"Убрать после");MakeButton(6,ID_UNDO,L"↶ Отмена");
-        MakeButton(7,ID_FAST,L"⚡ Быстро");MakeButton(8,ID_EXACT,L"◎ Точно");
+        MakeButton(7,ID_SAVE,L"Сохранить");
         g_loadAudio=CreateWindowW(L"BUTTON",L"Загрузить аудио",
             WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON|WS_TABSTOP,0,0,179,37,
             hwnd,(HMENU)(INT_PTR)ID_LOAD_AUDIO,GetModuleHandleW(nullptr),nullptr);
@@ -805,12 +908,48 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         g_status=CreateWindowW(L"STATIC",L"Откройте MP4. Можно перетащить файл в окно.",WS_CHILD|WS_VISIBLE|SS_LEFT|SS_ENDELLIPSIS,0,0,100,20,hwnd,nullptr,nullptr,nullptr);
         SendMessageW(g_time,WM_SETFONT,(WPARAM)g_font,TRUE);
         SendMessageW(g_status,WM_SETFONT,(WPARAM)g_font,TRUE);
-        Relayout();SetTimer(hwnd,1,110,nullptr);return 0;
+        Relayout();SetTimer(hwnd,1,60,nullptr);UpdatePlayButton();return 0;
     }
     case WM_GETMINMAXINFO:{
         auto p=(MINMAXINFO*)lp;p->ptMinTrackSize.x=960;p->ptMinTrackSize.y=635;return 0;
     }
     case WM_SIZE:Relayout();return 0;
+    case WM_PLAYER_EVENT:{
+        auto eventType=(MFP_EVENT_TYPE)wp;
+        IMFPMediaPlayer* source=(IMFPMediaPlayer*)lp;
+        if(source==g_player && g_player){
+            if(eventType==MFP_EVENT_TYPE_MEDIAITEM_SET){
+                g_playerReady=true;
+                g_player->SetAspectRatioMode(MFVideoARMode_PreservePicture);
+                SIZE native={},aspectCorrected={};
+                if(SUCCEEDED(g_player->GetNativeVideoSize(&native,&aspectCorrected))){
+                    if(aspectCorrected.cx>0&&aspectCorrected.cy>0){
+                        g_previewWidth=(UINT32)aspectCorrected.cx;
+                        g_previewHeight=(UINT32)aspectCorrected.cy;
+                    }
+                }
+                Relayout();
+                ClipPosition at=LocateClip(g_kept,g_cursor);
+                if(at.index>=0)SetPlayerPosition(g_player,at.source);
+                if(g_userWantsPlay)StartPlayback();
+                else BeginStillPreview();
+            }else if(eventType==MFP_EVENT_TYPE_PLAYBACK_ENDED && !g_previewPriming){
+                g_playing=false;g_userWantsPlay=false;
+                if(g_audioPlayer)g_audioPlayer->Pause();
+                UpdatePlayButton();
+            }
+        }else if(source==g_audioPlayer && g_audioPlayer){
+            if(eventType==MFP_EVENT_TYPE_MEDIAITEM_SET){
+                g_audioReady=true;
+                ClipPosition a=LocateClip(g_audioKept,g_cursor);
+                if(a.index>=0){
+                    SetPlayerPosition(g_audioPlayer,a.source);
+                    if(g_playing)g_audioPlayer->Play();
+                }
+            }
+        }
+        return 0;
+    }
     case WM_DROPFILES:{
         HDROP drop=(HDROP)wp;wchar_t p[MAX_PATH]={};
         if(DragQueryFileW(drop,0,p,MAX_PATH))OpenFile(p);
@@ -826,6 +965,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         RECT row=audio?g_audioTrack:g_montageTrack;
         int index=ClipAtX(clips,p.x,row);
         if(index<0)break;
+        SetFocus(hwnd); // Follow selection: Delete and Ctrl+Z target this editor.
         g_focusAudio=audio;g_dragAudio=audio;
         if(audio)g_selectedAudio=index;else g_selected=index;
         g_dragging=false;g_clipDragging=false;
@@ -884,33 +1024,39 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             InvalidateRect(g_noAudio,nullptr,TRUE);
             Status(g_muteOriginal?L"Оригинальный звук отключён. Загруженное аудио останется.":L"Оригинальный звук включён.");
             break;
-        case ID_PLAY:
-            if(g_player){
-                if(g_playing){
-                    g_player->Pause();
-                    if(g_audioPlayer)g_audioPlayer->Pause();
-                    g_playing=false;
-                }else{
-                    if(g_cursor>=MontageDuration())SeekTo(0);
-                    if(SUCCEEDED(g_player->Play())){
-                        g_playing=true;
-                        ClipPosition a=LocateClip(g_audioKept,g_cursor);
-                        if(g_audioPlayer&&a.index>=0)g_audioPlayer->Play();
-                    }
-                }
-            }break;
+        case ID_PLAY:TogglePlayback();break;
         case ID_SPLIT:SplitHere();break;
         case ID_REMOVE:RemoveSelected();break;
         case ID_TRIM_START:if(!g_file.empty()&&!g_exporting)RemoveInterval(0,g_cursor);break;
         case ID_TRIM_END:if(!g_file.empty()&&!g_exporting)RemoveInterval(g_cursor,
             g_focusAudio?ClipsDuration(g_audioKept):MontageDuration());break;
         case ID_UNDO:Undo();break;
-        case ID_FAST:StartExport(false);break;
-        case ID_EXACT:StartExport(true);break;
+        case ID_SAVE:StartExport(false);break;
         }
         return 0;
     }
     case WM_TIMER:{
+        if(g_previewPriming && g_playerReady && g_player){
+            ULONGLONG elapsed=GetTickCount64()-g_primeSince;
+            PROPVARIANT pos;PropVariantInit(&pos);
+            bool moved=false;
+            if(SUCCEEDED(g_player->GetPosition(MFP_POSITIONTYPE_100NS,&pos))&&pos.vt==VT_I8){
+                LONGLONG position=pos.hVal.QuadPart;
+                moved=position>=g_primeSource+HNS/40 &&
+                      position<=g_primeSource+2*HNS;
+            }
+            PropVariantClear(&pos);
+            if((elapsed>=110 && moved)||elapsed>=520){
+                // The first frame has reached the renderer; freeze it without
+                // ever requiring the user to press Play to initialize MFPlay.
+                g_previewPriming=false;
+                g_player->Pause();
+                g_player->SetVolume(g_muteOriginal?0.0f:1.0f);
+                if(g_video)InvalidateRect(g_video,nullptr,FALSE);
+                g_player->UpdateVideo();
+                UpdatePlayButton();
+            }
+        }
         if(g_exporting){
             ++g_spinnerStep;
             RECT spinner=SpinnerRect();
@@ -931,6 +1077,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                         g_player->Pause();
                         if(g_audioPlayer)g_audioPlayer->Pause();
                         g_playing=false;g_cursor=MontageDuration();
+                        UpdatePlayButton();
                     }else SeekTo(next,true);
                 }else if(source>=clip.first){
                     g_cursor=startOffset+source-clip.first;
@@ -955,7 +1102,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(wp==1001){Status(L"Предпросмотр: Media Foundation сообщила об ошибке.");}
         else if(g_exporting){
             g_exportPercent=(int)wp;
-            Status(L"Экспорт: "+std::to_wstring(wp)+L"% …");
+            Status(L"Сохранение: "+std::to_wstring(wp)+L"% …");
             RECT spinner=SpinnerRect();InvalidateRect(hwnd,&spinner,FALSE);
         }
         return 0;
@@ -1036,20 +1183,21 @@ int APIENTRY wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show){
         nullptr,nullptr,instance,nullptr);
     if(!g_window){MFShutdown();CoUninitialize();return 3;}
     ShowWindow(g_window,show);UpdateWindow(g_window);
-    // Accelerators are routed even if a child button has the keyboard focus.
-    // Do not register global hotkeys: Delete/Ctrl+Z should work ONLY in MiniCut.
-    ACCEL shortcuts[2]={};
-    shortcuts[0].fVirt=FVIRTKEY|FCONTROL;
-    shortcuts[0].key='Z';shortcuts[0].cmd=ID_UNDO;
-    shortcuts[1].fVirt=FVIRTKEY;
-    shortcuts[1].key=VK_DELETE;shortcuts[1].cmd=ID_REMOVE;
-    HACCEL accelerators=CreateAcceleratorTableW(shortcuts,2);
+    // Dispatch shortcuts before focused child BUTTON controls consume key messages.
     MSG msg;
     while(GetMessageW(&msg,nullptr,0,0)>0){
-        if(!accelerators||!TranslateAcceleratorW(g_window,accelerators,&msg)){
-            TranslateMessage(&msg);DispatchMessageW(&msg);
+        if(msg.message==WM_KEYDOWN && !g_exporting){
+            if(msg.wParam==VK_DELETE){
+                SendMessageW(g_window,WM_COMMAND,MAKEWPARAM(ID_REMOVE,0),0);
+                continue;
+            }
+            if(msg.wParam=='Z' && (GetKeyState(VK_CONTROL)&0x8000) &&
+               !(GetKeyState(VK_MENU)&0x8000)){
+                SendMessageW(g_window,WM_COMMAND,MAKEWPARAM(ID_UNDO,0),0);
+                continue;
+            }
         }
+        TranslateMessage(&msg);DispatchMessageW(&msg);
     }
-    if(accelerators)DestroyAcceleratorTable(accelerators);
     MFShutdown();CoUninitialize();return (int)msg.wParam;
 }
