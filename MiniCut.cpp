@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <climits>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -205,7 +206,7 @@ void SplitHere(){
     Remember();
     Span old=g_kept[idx];g_kept[idx].last=g_cursor;
     g_kept.insert(g_kept.begin()+idx+1,{g_cursor,old.last});
-    g_selected=idx+1;Status(L"Разрезано. Щёлкните нужный фрагмент и нажмите «Удалить».");RedrawTrack();
+    g_selected=idx+1;Status(L"Разрезано. Перетащите часть в «Монтаже» или нажмите «Удалить».");RedrawTrack();
 }
 void RemoveSelected(){
     if(g_file.empty()||g_exporting)return;
@@ -609,25 +610,51 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_LBUTTONDOWN:{
         POINT p={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
-        if(g_file.empty()||g_exporting||!PtInRect(&g_track,p))break;
+        if(g_file.empty()||g_exporting)break;
+        if(PtInRect(&g_montageTrack,p)){
+            int index=MontageClipAtX(p.x);
+            if(index>=0){
+                g_clipMouseDown=true;g_clipDragging=false;
+                g_dragClipIndex=index;g_insertSlot=index;g_mousePt=p;g_selected=index;
+                SetCapture(hwnd);RedrawTrack();return 0;
+            }
+        }
+        if(!PtInRect(&g_track,p))break;
         g_mouseDown=true;g_dragging=false;g_dragStart=g_dragEnd=PosFromX(p.x);g_mousePt=p;
         g_cursor=g_dragStart;g_selected=SpanAt(g_cursor);SetCapture(hwnd);RedrawTrack();return 0;
     }
     case WM_MOUSEMOVE:{
-        if(!g_mouseDown)break;
         int x=GET_X_LPARAM(lp);
+        if(g_clipMouseDown){
+            if(abs(x-g_mousePt.x)>5)g_clipDragging=true;
+            if(g_clipDragging)g_insertSlot=MontageInsertSlot(x);
+            RedrawTrack();return 0;
+        }
+        if(!g_mouseDown)break;
         if(abs(x-g_mousePt.x)>5)g_dragging=true;
         g_dragEnd=PosFromX(x);g_cursor=g_dragEnd;RedrawTrack();return 0;
     }
     case WM_LBUTTONUP:{
+        if(g_clipMouseDown){
+            int source=g_dragClipIndex,slot=g_insertSlot;
+            bool moved=g_clipDragging;
+            g_clipMouseDown=false;g_clipDragging=false;g_dragClipIndex=-1;
+            ReleaseCapture();
+            if(moved)MoveClip(source,slot);
+            else if(source>=0&&source<(int)g_kept.size())SeekTo(g_kept[source].first);
+            RedrawTrack();return 0;
+        }
         if(!g_mouseDown)break;
-        ReleaseCapture();g_mouseDown=false;
+        g_mouseDown=false;ReleaseCapture();
         if(!g_dragging){SeekTo(g_dragStart);}
         else {g_cursor=g_dragEnd;Status(L"Диапазон выделен. Нажмите «Удалить», чтобы вырезать его.");RedrawTrack();}
         return 0;
     }
     case WM_KEYDOWN:{
         if(wp=='Z'&&(GetKeyState(VK_CONTROL)&0x8000)){Undo();return 0;}
+        if((wp==VK_LEFT||wp==VK_RIGHT)&&(GetKeyState(VK_CONTROL)&0x8000) && g_selected>=0){
+            MoveClip(g_selected,wp==VK_LEFT?g_selected-1:g_selected+2);return 0;
+        }
         if(wp==VK_DELETE){RemoveSelected();return 0;}
         if(wp==VK_SPACE){SendMessageW(hwnd,WM_COMMAND,ID_PLAY,0);return 0;}
         break;
@@ -658,8 +685,12 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             if(t<g_duration){
                 int idx=SpanAt(t);
                 if(idx<0){
-                    auto it=std::find_if(g_kept.begin(),g_kept.end(),[t](Span s){return s.first>t;});
-                    if(it!=g_kept.end())SeekTo(it->first);
+                    auto it=std::min_element(g_kept.begin(),g_kept.end(),[t](Span a,Span b){
+                        const LONGLONG nextA=a.first>t?a.first:LLONG_MAX;
+                        const LONGLONG nextB=b.first>t?b.first:LLONG_MAX;
+                        return nextA<nextB;
+                    });
+                    if(it!=g_kept.end()&&it->first>t)SeekTo(it->first);
                     else {g_player->Pause();g_playing=false;}
                 }else{
                     g_cursor=t;
