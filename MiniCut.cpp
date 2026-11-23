@@ -443,6 +443,8 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
             MixSourcePCM(externalAudio,audioSpans,mixedPCM);
         }
         Check(writer->BeginWriting(),L"Начало записи MP4");
+        LONGLONG audioWritten=0;
+        if(mixAudio)WriteMixedAudioUntil(writer.get(),audioStream,mixedPCM,audioWritten,HNS/5);
         LONGLONG offset=0;
         int lastPct=-1;
         for(const Span& part:spans){
@@ -485,13 +487,15 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
                 }
                 if(isVideo&&firstVideo){sample->SetUINT32(MFSampleExtension_Discontinuity,TRUE);firstVideo=false;}
                 if(isAudio&&firstAudio){sample->SetUINT32(MFSampleExtension_Discontinuity,TRUE);firstAudio=false;}
+                if(mixAudio && isVideo)
+                    WriteMixedAudioUntil(writer.get(),audioStream,mixedPCM,audioWritten,newTime+HNS/5);
                 Check(writer->WriteSample(isVideo?videoStream:audioStream,sample.get()),L"Запись кадра/звука");
                 int pct=(int)(100.0*(double)(offset+std::min(t-part.first,part.last-part.first))/(double)total);
                 if(pct!=lastPct){lastPct=pct;PostMessageW(notify,WM_EXPORT_PROGRESS,pct,0);}
             }
             offset+=part.last-part.first;
         }
-        if(mixAudio)WriteMixedAudio(writer.get(),audioStream,mixedPCM);
+        if(mixAudio)WriteMixedAudioUntil(writer.get(),audioStream,mixedPCM,audioWritten,total);
         Check(writer->Finalize(),L"Завершение MP4");
         result->ok=true;
         result->message=mixAudio?
