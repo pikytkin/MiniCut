@@ -537,129 +537,124 @@ void StartExport(bool exact){
 }
 
 
-LONGLONG MontageDuration(){
-    LONGLONG sum=0;
-    for(const Span& span:g_kept)sum+=std::max(0LL,span.last-span.first);
-    return sum;
-}
+LONGLONG MontageDuration(){return ClipsDuration(g_kept);}
 int MontageX(LONGLONG offset){
     LONGLONG total=MontageDuration();
     if(total<=0)return g_montageTrack.left;
-    double f=(double)offset/(double)total;
-    return g_montageTrack.left+(int)(f*(g_montageTrack.right-g_montageTrack.left));
+    return g_montageTrack.left+(int)((double)offset/total*(g_montageTrack.right-g_montageTrack.left));
 }
-RECT MontageClipRect(size_t index){
+LONGLONG PositionFromX(int x){
+    int width=std::max(1,static_cast<int>(g_montageTrack.right-g_montageTrack.left));
+    double fraction=std::max(0.0,std::min(1.0,(double)(x-g_montageTrack.left)/width));
+    return ClampTime((LONGLONG)(fraction*MontageDuration()),MontageDuration());
+}
+RECT ClipRect(const std::vector<Span>& clips,size_t index,RECT row){
     LONGLONG offset=0;
-    for(size_t i=0;i<index && i<g_kept.size();++i)
-        offset+=g_kept[i].last-g_kept[i].first;
+    for(size_t i=0;i<index&&i<clips.size();++i)offset+=clips[i].last-clips[i].first;
     int left=MontageX(offset);
-    if(index>=g_kept.size())
-        return {left,g_montageTrack.top,g_montageTrack.right,g_montageTrack.bottom};
-    int right=MontageX(offset+g_kept[index].last-g_kept[index].first);
-    if(index+1==g_kept.size())right=g_montageTrack.right;
-    return {left,g_montageTrack.top+2,right,g_montageTrack.bottom-2};
+    if(index>=clips.size())return {left,row.top,row.right,row.bottom};
+    int right=MontageX(offset+clips[index].last-clips[index].first);
+    if(index+1==clips.size())right=MontageX(ClipsDuration(clips));
+    return {left,row.top+2,right,row.bottom-2};
 }
-int MontageClipAtX(int x){
-    if(x<g_montageTrack.left||x>=g_montageTrack.right)return -1;
-    for(size_t i=0;i<g_kept.size();++i){
-        RECT r=MontageClipRect(i);
+RECT MontageClipRect(size_t index){return ClipRect(g_kept,index,g_montageTrack);}
+RECT AudioClipRect(size_t index){return ClipRect(g_audioKept,index,g_audioTrack);}
+int ClipAtX(const std::vector<Span>& clips,int x,RECT row){
+    if(x<row.left||x>=row.right)return -1;
+    for(size_t i=0;i<clips.size();++i){
+        RECT r=ClipRect(clips,i,row);
         if(x>=r.left&&x<r.right)return (int)i;
     }
     return -1;
 }
-int MontageInsertSlot(int x){
-    for(size_t i=0;i<g_kept.size();++i){
-        RECT r=MontageClipRect(i);
+int InsertSlot(const std::vector<Span>& clips,int x,RECT row){
+    for(size_t i=0;i<clips.size();++i){
+        RECT r=ClipRect(clips,i,row);
         if(x<(r.left+r.right)/2)return (int)i;
     }
-    return (int)g_kept.size();
+    return (int)clips.size();
 }
-void MoveClip(int from,int slot){
-    int n=(int)g_kept.size();
+void MoveClip(int from,int slot,bool audio){
+    auto& clips=audio?g_audioKept:g_kept;
+    int n=(int)clips.size();
     if(from<0||from>=n||g_exporting)return;
     slot=std::max(0,std::min(slot,n));
     int destination=slot>from?slot-1:slot;
     if(destination==from){RedrawTrack();return;}
     Remember();
-    Span selected=g_kept[from];
-    g_kept.erase(g_kept.begin()+from);
-    g_kept.insert(g_kept.begin()+destination,selected);
-    g_selected=destination;
-    Status(L"Порядок частей изменён. Экспорт сохранит этот порядок. Ctrl+Z — отмена.");
-    SeekTo(selected.first);
-}
-RECT TrackRect(){
-    RECT r;GetClientRect(g_window,&r);
-    return {20,r.bottom-156,r.right-20,r.bottom-143};
+    Span item=clips[from];
+    clips.erase(clips.begin()+from);
+    clips.insert(clips.begin()+destination,item);
+    if(audio)g_selectedAudio=destination;else g_selected=destination;
+    g_focusAudio=audio;
+    SeekTo(std::min(g_cursor,MontageDuration()));
+    Status(audio?L"Аудиочасти переставлены. Ctrl+Z — отмена.":L"Видеочасти переставлены. Экспорт сохранит этот порядок.");
 }
 RECT MontageTrackRect(){
     RECT r;GetClientRect(g_window,&r);
-    return {20,r.bottom-113,r.right-20,r.bottom-68};
+    return {18,r.bottom-175,r.right-18,r.bottom-145};
 }
-LONGLONG PosFromX(int x){
-    int span=std::max(1,static_cast<int>(g_track.right-g_track.left));
-    double f=(double)(x-g_track.left)/span;
-    return ClampTime((LONGLONG)(std::max(0.0,std::min(1.0,f))*g_duration),g_duration);
+RECT AudioTrackRect(){
+    RECT r;GetClientRect(g_window,&r);
+    return {18,r.bottom-110,r.right-18,r.bottom-80};
 }
-int XFromPos(LONGLONG t){
-    if(g_duration<=0)return g_track.left;
-    double frac=(double)t/(double)g_duration;
-    return g_track.left+(int)(frac*(g_track.right-g_track.left));
-}
-void DrawTimeline(HDC dc){
-    if(g_duration<=0)return;
-    RECT track=g_track;
-    SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(194,203,216));
-    RECT sourceLabel={track.left,track.top-23,track.right,track.top-1};
-    DrawTextW(dc,L"Исходник: щелчок — перемотка, протяжка — выделение участка",-1,
-              &sourceLabel,DT_SINGLELINE|DT_LEFT|DT_VCENTER);
-    HBRUSH bg=CreateSolidBrush(RGB(75,42,47));FillRect(dc,&track,bg);DeleteObject(bg);
-    for(size_t i=0;i<g_kept.size();++i){
-        RECT r={XFromPos(g_kept[i].first),track.top,XFromPos(g_kept[i].last),track.bottom};
+void DrawTrack(HDC dc,const std::vector<Span>& clips,RECT track,bool audio){
+    HBRUSH bg=CreateSolidBrush(audio?RGB(48,62,79):RGB(56,60,72));
+    FillRect(dc,&track,bg);DeleteObject(bg);
+    for(size_t i=0;i<clips.size();++i){
+        RECT r=ClipRect(clips,i,track);
         if(r.right<=r.left)continue;
-        HBRUSH fill=CreateSolidBrush((int)i==g_selected?RGB(62,151,207):RGB(76,111,151));
+        bool active=(audio?g_selectedAudio:g_selected)==(int)i && g_focusAudio==audio;
+        HBRUSH fill=CreateSolidBrush(audio?(active?RGB(71,175,142):RGB(55,123,112)):
+                                           (active?RGB(67,151,206):RGB(74,108,148)));
         FillRect(dc,&r,fill);DeleteObject(fill);
-    }
-    if(g_dragging){
-        int a=XFromPos(g_dragStart),b=XFromPos(g_dragEnd);if(a>b)std::swap(a,b);
-        HBRUSH overlay=CreateHatchBrush(HS_DIAGCROSS,RGB(250,180,70));
-        RECT sel={a,track.top,b,track.bottom};
-        if(sel.right>sel.left){SetBkMode(dc,TRANSPARENT);FillRect(dc,&sel,overlay);}DeleteObject(overlay);
-    }
-    int x=XFromPos(g_cursor);
-    HPEN pen=CreatePen(PS_SOLID,2,RGB(255,229,116));HPEN old=(HPEN)SelectObject(dc,pen);
-    MoveToEx(dc,x,track.top-3,nullptr);LineTo(dc,x,track.bottom+3);
-    SelectObject(dc,old);DeleteObject(pen);
-    RECT montage=g_montageTrack;
-    SetTextColor(dc,RGB(194,203,216));
-    RECT montageLabel={montage.left,montage.top-24,montage.right,montage.top-2};
-    DrawTextW(dc,L"Монтаж: перетащите часть мышью, чтобы поменять порядок экспорта",-1,
-              &montageLabel,DT_SINGLELINE|DT_LEFT|DT_VCENTER);
-    HBRUSH montageBg=CreateSolidBrush(RGB(58,64,75));
-    FillRect(dc,&montage,montageBg);DeleteObject(montageBg);
-    for(size_t i=0;i<g_kept.size();++i){
-        RECT r=MontageClipRect(i);
-        if(r.right<=r.left)continue;
-        HBRUSH fill=CreateSolidBrush((int)i==g_selected?RGB(62,151,207):RGB(76,111,151));
-        FillRect(dc,&r,fill);DeleteObject(fill);
-        HPEN div=CreatePen(PS_SOLID,2,RGB(25,29,36));
-        HPEN previous=(HPEN)SelectObject(dc,div);
-        MoveToEx(dc,r.left,montage.top,nullptr);LineTo(dc,r.left,montage.bottom);
-        SelectObject(dc,previous);DeleteObject(div);
-        if(r.right-r.left>47){
-            SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(255,255,255));
-            std::wstring name=L"Часть "+std::to_wstring(i+1);
-            RECT txt=r;txt.left+=3;txt.right-=3;
-            DrawTextW(dc,name.c_str(),-1,&txt,DT_SINGLELINE|DT_CENTER|DT_VCENTER|DT_END_ELLIPSIS);
+        HPEN sep=CreatePen(PS_SOLID,2,RGB(23,27,33));
+        HPEN old=(HPEN)SelectObject(dc,sep);
+        MoveToEx(dc,r.left,track.top,nullptr);LineTo(dc,r.left,track.bottom);
+        SelectObject(dc,old);DeleteObject(sep);
+        if(r.right-r.left>56){
+            RECT label=r;label.left+=3;label.right-=3;
+            std::wstring name=(audio?L"Аудио ":L"Часть ")+std::to_wstring(i+1);
+            SetTextColor(dc,RGB(249,252,255));SetBkMode(dc,TRANSPARENT);
+            DrawTextW(dc,name.c_str(),-1,&label,DT_SINGLELINE|DT_CENTER|DT_VCENTER|DT_END_ELLIPSIS);
         }
     }
+}
+void DrawTimeline(HDC dc){
+    if(g_file.empty())return;
+    RECT video=g_montageTrack,audio=g_audioTrack;
+    SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(191,206,224));
+    RECT label={video.left,video.top-24,video.right,video.top-3};
+    DrawTextW(dc,L"ВИДЕО — тяните часть для перестановки · Shift+протяжка — выделить",-1,
+              &label,DT_SINGLELINE|DT_LEFT|DT_VCENTER);
+    DrawTrack(dc,g_kept,video,false);
+    label={audio.left,audio.top-24,audio.right,audio.top-3};
+    std::wstring labelAudio=g_audioFile.empty()?L"АУДИО — нажмите «Загрузить аудио»":
+                                           L"АУДИО — тяните для перестановки · Shift+протяжка — выделить";
+    DrawTextW(dc,labelAudio.c_str(),-1,&label,DT_SINGLELINE|DT_LEFT|DT_VCENTER);
+    DrawTrack(dc,g_audioKept,audio,true);
+    if(g_dragging){
+        int a=MontageX(g_dragStart),b=MontageX(g_dragEnd);
+        if(a>b)std::swap(a,b);
+        RECT row=g_focusAudio?audio:video;
+        RECT sel={a,row.top,b,row.bottom};
+        HBRUSH overlay=CreateHatchBrush(HS_DIAGCROSS,RGB(250,180,70));
+        FillRect(dc,&sel,overlay);DeleteObject(overlay);
+    }
+    int cursorX=MontageX(g_cursor);
+    HPEN pen=CreatePen(PS_SOLID,2,RGB(255,233,105));
+    HPEN old=(HPEN)SelectObject(dc,pen);
+    MoveToEx(dc,cursorX,video.top-5,nullptr);LineTo(dc,cursorX,audio.bottom+4);
+    SelectObject(dc,old);DeleteObject(pen);
     if(g_clipDragging){
-        int slot=std::max(0,std::min(g_insertSlot,(int)g_kept.size()));
-        int pos=slot==(int)g_kept.size()?montage.right:MontageClipRect(slot).left;
-        HPEN highlight=CreatePen(PS_SOLID,3,RGB(255,229,116));
-        HPEN previous=(HPEN)SelectObject(dc,highlight);
-        MoveToEx(dc,pos,montage.top-3,nullptr);LineTo(dc,pos,montage.bottom+3);
-        SelectObject(dc,previous);DeleteObject(highlight);
+        const auto& clips=g_dragAudio?g_audioKept:g_kept;
+        RECT row=g_dragAudio?audio:video;
+        int slot=std::max(0,std::min(g_insertSlot,(int)clips.size()));
+        int x=slot==(int)clips.size()?MontageX(ClipsDuration(clips)):ClipRect(clips,slot,row).left;
+        HPEN target=CreatePen(PS_SOLID,3,RGB(255,233,105));
+        old=(HPEN)SelectObject(dc,target);
+        MoveToEx(dc,x,row.top-5,nullptr);LineTo(dc,x,row.bottom+5);
+        SelectObject(dc,old);DeleteObject(target);
     }
 }
 void Relayout(){
