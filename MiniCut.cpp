@@ -423,9 +423,65 @@ void StartExport(bool exact){
     }).detach();
 }
 
+
+LONGLONG MontageDuration(){
+    LONGLONG sum=0;
+    for(const Span& span:g_kept)sum+=std::max(0LL,span.last-span.first);
+    return sum;
+}
+int MontageX(LONGLONG offset){
+    LONGLONG total=MontageDuration();
+    if(total<=0)return g_montageTrack.left;
+    double f=(double)offset/(double)total;
+    return g_montageTrack.left+(int)(f*(g_montageTrack.right-g_montageTrack.left));
+}
+RECT MontageClipRect(size_t index){
+    LONGLONG offset=0;
+    for(size_t i=0;i<index && i<g_kept.size();++i)
+        offset+=g_kept[i].last-g_kept[i].first;
+    int left=MontageX(offset);
+    if(index>=g_kept.size())
+        return {left,g_montageTrack.top,g_montageTrack.right,g_montageTrack.bottom};
+    int right=MontageX(offset+g_kept[index].last-g_kept[index].first);
+    if(index+1==g_kept.size())right=g_montageTrack.right;
+    return {left,g_montageTrack.top+2,right,g_montageTrack.bottom-2};
+}
+int MontageClipAtX(int x){
+    if(x<g_montageTrack.left||x>=g_montageTrack.right)return -1;
+    for(size_t i=0;i<g_kept.size();++i){
+        RECT r=MontageClipRect(i);
+        if(x>=r.left&&x<r.right)return (int)i;
+    }
+    return -1;
+}
+int MontageInsertSlot(int x){
+    for(size_t i=0;i<g_kept.size();++i){
+        RECT r=MontageClipRect(i);
+        if(x<(r.left+r.right)/2)return (int)i;
+    }
+    return (int)g_kept.size();
+}
+void MoveClip(int from,int slot){
+    int n=(int)g_kept.size();
+    if(from<0||from>=n||g_exporting)return;
+    slot=std::max(0,std::min(slot,n));
+    int destination=slot>from?slot-1:slot;
+    if(destination==from){RedrawTrack();return;}
+    Remember();
+    Span selected=g_kept[from];
+    g_kept.erase(g_kept.begin()+from);
+    g_kept.insert(g_kept.begin()+destination,selected);
+    g_selected=destination;
+    Status(L"Порядок частей изменён. Экспорт сохранит этот порядок. Ctrl+Z — отмена.");
+    SeekTo(selected.first);
+}
 RECT TrackRect(){
     RECT r;GetClientRect(g_window,&r);
-    return {20,r.bottom-124,r.right-20,r.bottom-66};
+    return {20,r.bottom-156,r.right-20,r.bottom-143};
+}
+RECT MontageTrackRect(){
+    RECT r;GetClientRect(g_window,&r);
+    return {20,r.bottom-113,r.right-20,r.bottom-68};
 }
 LONGLONG PosFromX(int x){
     int span=std::max(1,static_cast<int>(g_track.right-g_track.left));
@@ -440,20 +496,16 @@ int XFromPos(LONGLONG t){
 void DrawTimeline(HDC dc){
     if(g_duration<=0)return;
     RECT track=g_track;
+    SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(194,203,216));
+    RECT sourceLabel={track.left,track.top-23,track.right,track.top-1};
+    DrawTextW(dc,L"Исходник: щелчок — перемотка, протяжка — выделение участка",-1,
+              &sourceLabel,DT_SINGLELINE|DT_LEFT|DT_VCENTER);
     HBRUSH bg=CreateSolidBrush(RGB(75,42,47));FillRect(dc,&track,bg);DeleteObject(bg);
     for(size_t i=0;i<g_kept.size();++i){
-        RECT r={XFromPos(g_kept[i].first),track.top+3,XFromPos(g_kept[i].last),track.bottom-3};
+        RECT r={XFromPos(g_kept[i].first),track.top,XFromPos(g_kept[i].last),track.bottom};
         if(r.right<=r.left)continue;
         HBRUSH fill=CreateSolidBrush((int)i==g_selected?RGB(62,151,207):RGB(76,111,151));
         FillRect(dc,&r,fill);DeleteObject(fill);
-        if(r.right-r.left>55){
-            SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(255,255,255));
-            std::wstring name=L"Часть "+std::to_wstring(i+1);
-            DrawTextW(dc,name.c_str(),-1,&r,DT_SINGLELINE|DT_CENTER|DT_VCENTER|DT_END_ELLIPSIS);
-        }
-        HPEN sep=CreatePen(PS_SOLID,2,RGB(19,24,31));HPEN old=(HPEN)SelectObject(dc,sep);
-        MoveToEx(dc,r.left,track.top,nullptr);LineTo(dc,r.left,track.bottom);
-        SelectObject(dc,old);DeleteObject(sep);
     }
     if(g_dragging){
         int a=XFromPos(g_dragStart),b=XFromPos(g_dragEnd);if(a>b)std::swap(a,b);
@@ -463,13 +515,39 @@ void DrawTimeline(HDC dc){
     }
     int x=XFromPos(g_cursor);
     HPEN pen=CreatePen(PS_SOLID,2,RGB(255,229,116));HPEN old=(HPEN)SelectObject(dc,pen);
-    MoveToEx(dc,x,track.top-9,nullptr);LineTo(dc,x,track.bottom+4);
+    MoveToEx(dc,x,track.top-3,nullptr);LineTo(dc,x,track.bottom+3);
     SelectObject(dc,old);DeleteObject(pen);
-    SetTextColor(dc,RGB(194,203,216));SetBkMode(dc,TRANSPARENT);
-    RECT left={track.left,track.bottom+7,track.right,track.bottom+27};
-    DrawTextW(dc,L"00:00:00",-1,&left,DT_LEFT|DT_SINGLELINE);
-    std::wstring end=TimeLabel(g_duration);
-    DrawTextW(dc,end.c_str(),-1,&left,DT_RIGHT|DT_SINGLELINE);
+    RECT montage=g_montageTrack;
+    SetTextColor(dc,RGB(194,203,216));
+    RECT montageLabel={montage.left,montage.top-24,montage.right,montage.top-2};
+    DrawTextW(dc,L"Монтаж: перетащите часть мышью, чтобы поменять порядок экспорта",-1,
+              &montageLabel,DT_SINGLELINE|DT_LEFT|DT_VCENTER);
+    HBRUSH montageBg=CreateSolidBrush(RGB(58,64,75));
+    FillRect(dc,&montage,montageBg);DeleteObject(montageBg);
+    for(size_t i=0;i<g_kept.size();++i){
+        RECT r=MontageClipRect(i);
+        if(r.right<=r.left)continue;
+        HBRUSH fill=CreateSolidBrush((int)i==g_selected?RGB(62,151,207):RGB(76,111,151));
+        FillRect(dc,&r,fill);DeleteObject(fill);
+        HPEN div=CreatePen(PS_SOLID,2,RGB(25,29,36));
+        HPEN previous=(HPEN)SelectObject(dc,div);
+        MoveToEx(dc,r.left,montage.top,nullptr);LineTo(dc,r.left,montage.bottom);
+        SelectObject(dc,previous);DeleteObject(div);
+        if(r.right-r.left>47){
+            SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(255,255,255));
+            std::wstring name=L"Часть "+std::to_wstring(i+1);
+            RECT txt=r;txt.left+=3;txt.right-=3;
+            DrawTextW(dc,name.c_str(),-1,&txt,DT_SINGLELINE|DT_CENTER|DT_VCENTER|DT_END_ELLIPSIS);
+        }
+    }
+    if(g_clipDragging){
+        int slot=std::max(0,std::min(g_insertSlot,(int)g_kept.size()));
+        int pos=slot==(int)g_kept.size()?montage.right:MontageClipRect(slot).left;
+        HPEN highlight=CreatePen(PS_SOLID,3,RGB(255,229,116));
+        HPEN previous=(HPEN)SelectObject(dc,highlight);
+        MoveToEx(dc,pos,montage.top-3,nullptr);LineTo(dc,pos,montage.bottom+3);
+        SelectObject(dc,previous);DeleteObject(highlight);
+    }
 }
 void Relayout(){
     if(!g_window)return;
@@ -482,6 +560,7 @@ void Relayout(){
     for(int i=0;i<7;++i){if(g_buttons[i])MoveWindow(g_buttons[i],x,row1,sizes[i],32,TRUE);x+=sizes[i]+8;}
     if(g_time)MoveWindow(g_time,20,h-207,w-40,30,TRUE);
     g_track=TrackRect();
+    g_montageTrack=MontageTrackRect();
     if(g_buttons[7])MoveWindow(g_buttons[7],w-302,h-51,138,34,TRUE);
     if(g_buttons[8])MoveWindow(g_buttons[8],w-154,h-51,134,34,TRUE);
     if(g_noAudio)MoveWindow(g_noAudio,20,h-51,194,34,TRUE);
