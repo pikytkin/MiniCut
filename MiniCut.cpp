@@ -856,6 +856,32 @@ void DrawExportSpinner(HDC dc){
         SelectObject(dc,old);DeleteObject(dot);
     }
 }
+// MFPlay paints its own child video window. The default STATIC control paint
+// can overwrite the frame, and MFPlay needs UpdateVideo after resize/repaint.
+LRESULT CALLBACK VideoWindowSubclass(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp,
+                                      UINT_PTR subclassId,DWORD_PTR){
+    if(msg==WM_PAINT){
+        PAINTSTRUCT ps;HDC dc=BeginPaint(hwnd,&ps);
+        if(g_player && g_playerReady){
+            g_player->UpdateVideo();
+        }else{
+            RECT r;GetClientRect(hwnd,&r);
+            HBRUSH bg=CreateSolidBrush(RGB(30,33,40));
+            FillRect(dc,&r,bg);DeleteObject(bg);
+        }
+        EndPaint(hwnd,&ps);
+        return 0;
+    }
+    if(msg==WM_SIZE){
+        LRESULT result=DefSubclassProc(hwnd,msg,wp,lp);
+        if(g_player && g_playerReady)g_player->UpdateVideo();
+        return result;
+    }
+    if(msg==WM_ERASEBKGND)return TRUE;
+    if(msg==WM_NCDESTROY)RemoveWindowSubclass(hwnd,VideoWindowSubclass,subclassId);
+    return DefSubclassProc(hwnd,msg,wp,lp);
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     switch(msg){
     case WM_CREATE:{
@@ -863,8 +889,9 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         DragAcceptFiles(hwnd,TRUE);
         g_font=CreateFontW(-16,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
-        g_video=CreateWindowExW(WS_EX_CLIENTEDGE,L"STATIC",L"Откройте видео",
+        g_video=CreateWindowExW(WS_EX_CLIENTEDGE,L"STATIC",L"",
             WS_CHILD|WS_VISIBLE|SS_BLACKRECT,0,0,100,100,hwnd,nullptr,GetModuleHandleW(nullptr),nullptr);
+        if(g_video)SetWindowSubclass(g_video,VideoWindowSubclass,1,0);
         MakeButton(0,ID_OPEN,L"Открыть MP4");MakeButton(1,ID_PLAY,L"▶ / Пауза");
         MakeButton(2,ID_SPLIT,L"✂ Разрезать");MakeButton(3,ID_REMOVE,L"Удалить");
         MakeButton(4,ID_TRIM_START,L"Убрать до курсора");
