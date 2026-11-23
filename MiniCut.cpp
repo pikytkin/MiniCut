@@ -614,6 +614,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(PtInRect(&g_montageTrack,p)){
             int index=MontageClipAtX(p.x);
             if(index>=0){
+                g_dragging=false; // Selecting a clip cancels source-range selection.
                 g_clipMouseDown=true;g_clipDragging=false;
                 g_dragClipIndex=index;g_insertSlot=index;g_mousePt=p;g_selected=index;
                 SetCapture(hwnd);RedrawTrack();return 0;
