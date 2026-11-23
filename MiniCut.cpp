@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <climits>
 #include <cstdint>
 #include <memory>
@@ -79,6 +80,9 @@ std::wstring TimeLabel(LONGLONG t) {
 
 HWND g_window=nullptr,g_video=nullptr,g_status=nullptr,g_time=nullptr,g_noAudio=nullptr,g_loadAudio=nullptr;
 HWND g_buttons[9]={};
+UINT32 g_previewWidth=0,g_previewHeight=0;
+int g_spinnerStep=0,g_exportPercent=-1;
+void Relayout();
 HFONT g_font=nullptr;
 IMFPMediaPlayer* g_player=nullptr;
 IMFPMediaPlayer* g_audioPlayer=nullptr;
@@ -104,12 +108,20 @@ void Status(const std::wstring& text) { if(g_status) SetWindowTextW(g_status,tex
 void ShowFail(const wchar_t* title, const std::wstring& detail) {
     MessageBoxW(g_window,detail.c_str(),title,MB_OK|MB_ICONERROR);
 }
-void RedrawTrack() { if(g_window){InvalidateRect(g_window,&g_montageTrack,FALSE);InvalidateRect(g_window,&g_audioTrack,FALSE);} }
+void RedrawTrack() {
+    if(!g_window)return;
+    // Invalidate the full vertical cursor: it also crosses the gap BETWEEN tracks.
+    RECT dirty={g_montageTrack.left-4,g_montageTrack.top-9,
+                g_audioTrack.right+4,g_audioTrack.bottom+9};
+    InvalidateRect(g_window,&dirty,TRUE);
+}
 void SetUIBusy(bool busy) {
     g_exporting=busy;
     for(auto& b:g_buttons) if(b) EnableWindow(b,!busy);
     if(g_noAudio)EnableWindow(g_noAudio,!busy);
     if(g_loadAudio)EnableWindow(g_loadAudio,!busy);
+    if(!busy)g_exportPercent=-1;
+    if(g_window)InvalidateRect(g_window,nullptr,FALSE);
 }
 
 class PlayerCallback final:public IMFPMediaPlayerCallback {
@@ -172,18 +184,22 @@ void SetPlayerPosition(IMFPMediaPlayer* player,LONGLONG time){
     pos.vt=VT_I8;pos.hVal.QuadPart=std::max(0LL,time);
     player->SetPosition(MFP_POSITIONTYPE_100NS,&pos);
 }
-void SeekTo(LONGLONG t) {
+void SeekTo(LONGLONG t,bool keepAudioContinuous=false) {
     g_cursor=ClampTime(t,MontageDuration());
     ClipPosition v=LocateClip(g_kept,g_cursor);
     g_previewClip=v.index;
     if(g_player&&v.index>=0)SetPlayerPosition(g_player,v.source);
     ClipPosition a=LocateClip(g_audioKept,g_cursor);
+    int oldAudioClip=g_previewAudioClip;
     g_previewAudioClip=a.index;
     if(g_audioPlayer){
+        // Video edits can jump in source time while the imported audio is continuous.
+        // Do not seek or restart audio unless the AUDIOTRACK itself has a cut.
+        bool audioChanged=!keepAudioContinuous || oldAudioClip!=a.index;
         if(a.index>=0){
-            SetPlayerPosition(g_audioPlayer,a.source);
-            if(g_playing)g_audioPlayer->Play();
-        }else g_audioPlayer->Pause();
+            if(audioChanged)SetPlayerPosition(g_audioPlayer,a.source);
+            if(g_playing && audioChanged)g_audioPlayer->Play();
+        }else if(audioChanged)g_audioPlayer->Pause();
     }
     if(g_time)SetWindowTextW(g_time,(TimeLabel(g_cursor)+L" / "+TimeLabel(MontageDuration())).c_str());
     RedrawTrack();
@@ -204,7 +220,10 @@ void OpenFile(const std::wstring& file) {
         ComPtr<IMFMediaType> videoType;
         Check(source->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,0,videoType.put()),L"Видео не найдено");
         if(newDuration<=0)throw MediaError{E_INVALIDARG,L"Видео пустое"};
+        UINT32 nativeWidth=0,nativeHeight=0;
+        MFGetAttributeSize(videoType.get(),MF_MT_FRAME_SIZE,&nativeWidth,&nativeHeight);
         StopPlayer();
+        g_previewWidth=nativeWidth;g_previewHeight=nativeHeight;
         g_file=file;g_duration=newDuration;g_cursor=0;
         g_audioFile.clear();g_audioKept.clear();g_audioDuration=0;
         g_kept={{0,g_duration}};g_history.clear();g_selected=0;g_selectedAudio=-1;
@@ -215,7 +234,7 @@ void OpenFile(const std::wstring& file) {
         else Status(L"Перетаскивайте клипы мышью. Shift+протяжка — выделить диапазон для удаления.");
         SetWindowTextW(g_window,(L"MiniCut — "+file).c_str());
         if(g_player)g_player->SetVolume(g_muteOriginal?0.0f:1.0f);
-        SeekTo(0);InvalidateRect(g_window,nullptr,FALSE);
+        Relayout();SeekTo(0);InvalidateRect(g_window,nullptr,FALSE);
     }catch(const MediaError& e){ShowFail(L"Открытие файла",ErrorText(e));}
 }
 void OpenAudioFile(const std::wstring& file){
@@ -340,6 +359,7 @@ void CopyAttribute(IMFAttributes* from,IMFAttributes* to,const GUID& guid) {
 }
 
 #include "MiniCutAudio.h"
+#include "MiniCutVideo.h"
 // FAST remuxes H.264; EXACT decodes video to RGB32 before encoding.
 // Imported audio is mixed with original audio in PCM and encoded to AAC.
 
@@ -354,13 +374,7 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
     try {
         Check(MFStartup(MF_VERSION),L"Инициализация Media Foundation"); mfOk=true;
         ComPtr<IMFSourceReader> reader;
-        ComPtr<IMFAttributes> readerAttrs;
-        if(exact){
-            Check(MFCreateAttributes(readerAttrs.put(),2),L"Настройки видеодекодера");
-            Check(readerAttrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,TRUE),
-                  L"Цветовое преобразование кадров");
-        }
-        Check(MFCreateSourceReaderFromURL(input.c_str(),readerAttrs.get(),reader.put()),L"Открытие исходного файла");
+        Check(MFCreateSourceReaderFromURL(input.c_str(),nullptr,reader.put()),L"Открытие исходного файла");
         ComPtr<IMFMediaType> nativeVideo,nativeAudio;
         Check(reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,0,nativeVideo.put()),L"Видео дорожка не найдена");
         GUID videoSubtype={};
@@ -396,16 +410,20 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
         if(exact){
             Check(MFCreateMediaType(videoInput.put()),L"Формат декодирования");
             Check(videoInput->SetGUID(MF_MT_MAJOR_TYPE,MFMediaType_Video),L"Видео тип");
-            Check(videoInput->SetGUID(MF_MT_SUBTYPE,MFVideoFormat_RGB32),L"RGB32");
-            Check(reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,nullptr,videoInput.get()),L"Цветовое преобразование видео в RGB32");
+            Check(videoInput->SetGUID(MF_MT_SUBTYPE,MFVideoFormat_NV12),L"NV12");
+            Check(reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,nullptr,videoInput.get()),L"Декодирование в NV12");
             videoInput.reset();
-            Check(reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,videoInput.put()),L"Получение параметров RGB32");
+            Check(reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,videoInput.put()),L"Получение типа NV12");
+            // Normalize packed stride for H264 encoder. Decoder's NV12 buffers may
+            // have padded rows and must not be forwarded unchanged.
+            UINT32 frameW=0,frameH=0;
+            Check(MFGetAttributeSize(videoInput.get(),MF_MT_FRAME_SIZE,&frameW,&frameH),L"Размер видеокадра");
             Check(MFCreateMediaType(videoOutput.put()),L"Формат H.264");
             Check(videoOutput->SetGUID(MF_MT_MAJOR_TYPE,MFMediaType_Video),L"Видео тип H.264");
             Check(videoOutput->SetGUID(MF_MT_SUBTYPE,MFVideoFormat_H264),L"Видеокодек H.264");
-            CopyAttribute(nativeVideo.get(),videoOutput.get(),MF_MT_FRAME_SIZE);
-            CopyAttribute(nativeVideo.get(),videoOutput.get(),MF_MT_FRAME_RATE);
-            CopyAttribute(nativeVideo.get(),videoOutput.get(),MF_MT_PIXEL_ASPECT_RATIO);
+            CopyAttribute(videoInput.get(),videoOutput.get(),MF_MT_FRAME_SIZE);
+            CopyAttribute(videoInput.get(),videoOutput.get(),MF_MT_FRAME_RATE);
+            CopyAttribute(videoInput.get(),videoOutput.get(),MF_MT_PIXEL_ASPECT_RATIO);
             CopyAttribute(nativeVideo.get(),videoOutput.get(),MF_MT_VIDEO_PRIMARIES);
             CopyAttribute(nativeVideo.get(),videoOutput.get(),MF_MT_TRANSFER_FUNCTION);
             CopyAttribute(nativeVideo.get(),videoOutput.get(),MF_MT_YUV_MATRIX);
@@ -489,7 +507,15 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
                 if(isAudio&&firstAudio){sample->SetUINT32(MFSampleExtension_Discontinuity,TRUE);firstAudio=false;}
                 if(mixAudio && isVideo)
                     WriteMixedAudioUntil(writer.get(),audioStream,mixedPCM,audioWritten,newTime+HNS/5);
-                Check(writer->WriteSample(isVideo?videoStream:audioStream,sample.get()),L"Запись кадра/звука");
+                if(exact && isVideo){
+                    // Do not feed GPU-aligned / bottom-up 2D decoder surfaces directly
+                    // into the H264 encoder, which assumes a packed NV12 layout.
+                    ComPtr<IMFSample> packed;
+                    CopyNV12ForEncoder(sample.get(),frameW,frameH,packed.put());
+                    Check(writer->WriteSample(videoStream,packed.get()),L"Запись плотного NV12 кадра");
+                }else{
+                    Check(writer->WriteSample(isVideo?videoStream:audioStream,sample.get()),L"Запись кадра/звука");
+                }
                 int pct=(int)(100.0*(double)(offset+std::min(t-part.first,part.last-part.first))/(double)total);
                 if(pct!=lastPct){lastPct=pct;PostMessageW(notify,WM_EXPORT_PROGRESS,pct,0);}
             }
@@ -533,6 +559,7 @@ void StartExport(bool exact){
     }
     bool muteAudio=g_muteOriginal;
     SetUIBusy(true);
+    g_spinnerStep=0;g_exportPercent=0;
     Status(exact?L"Точный экспорт: кодирование кадр за кадром…":L"Быстрый экспорт: поиск ключевых кадров…");
     std::thread([win=g_window,src=g_file,dst=output,parts=g_kept,len=g_duration,exact,muteAudio,
                  audio=g_audioFile,audioParts=g_audioKept](){
@@ -665,7 +692,16 @@ void Relayout(){
     if(!g_window)return;
     RECT r;GetClientRect(g_window,&r);
     int w=r.right,h=r.bottom;
-    if(g_video)MoveWindow(g_video,18,54,w-36,std::max(120,h-362),TRUE);
+    // Preserve source sharpness: never upscale low-resolution video.
+    int areaW=w-36,areaH=std::max(120,h-362),videoW=areaW,videoH=areaH;
+    if(g_previewWidth&&g_previewHeight){
+        double scale=std::min(1.0,std::min((double)areaW/g_previewWidth,
+                                          (double)areaH/g_previewHeight));
+        videoW=std::max(1,(int)(g_previewWidth*scale));
+        videoH=std::max(1,(int)(g_previewHeight*scale));
+    }
+    if(g_video)MoveWindow(g_video,18+(areaW-videoW)/2,54+(areaH-videoH)/2,
+                          videoW,videoH,TRUE);
     int row=h-297,x=18;
     auto place=[&](HWND hwnd,int width){
         if(hwnd)MoveWindow(hwnd,x,row,width,37,TRUE);
@@ -850,7 +886,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                         g_player->Pause();
                         if(g_audioPlayer)g_audioPlayer->Pause();
                         g_playing=false;g_cursor=MontageDuration();
-                    }else SeekTo(next);
+                    }else SeekTo(next,true);
                 }else if(source>=clip.first){
                     g_cursor=startOffset+source-clip.first;
                     ClipPosition audio=LocateClip(g_audioKept,g_cursor);
