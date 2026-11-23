@@ -109,6 +109,7 @@ POINT g_mousePt={};
 RECT g_montageTrack={},g_audioTrack={};
 LONGLONG MontageDuration();
 int MontageX(LONGLONG t);
+void SeekTo(LONGLONG t,bool keepAudioContinuous=false);
 void UpdatePlayButton();
 void BeginStillPreview();
 
@@ -256,7 +257,7 @@ void TogglePlayback(){
         UpdatePlayButton();
     }else StartPlayback();
 }
-void SeekTo(LONGLONG t,bool keepAudioContinuous=false) {
+void SeekTo(LONGLONG t,bool keepAudioContinuous) {
     g_cursor=ClampTime(t,MontageDuration());
     ClipPosition v=LocateClip(g_kept,g_cursor);
     g_previewClip=v.index;
@@ -880,12 +881,48 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         g_status=CreateWindowW(L"STATIC",L"Откройте MP4. Можно перетащить файл в окно.",WS_CHILD|WS_VISIBLE|SS_LEFT|SS_ENDELLIPSIS,0,0,100,20,hwnd,nullptr,nullptr,nullptr);
         SendMessageW(g_time,WM_SETFONT,(WPARAM)g_font,TRUE);
         SendMessageW(g_status,WM_SETFONT,(WPARAM)g_font,TRUE);
-        Relayout();SetTimer(hwnd,1,110,nullptr);return 0;
+        Relayout();SetTimer(hwnd,1,60,nullptr);UpdatePlayButton();return 0;
     }
     case WM_GETMINMAXINFO:{
         auto p=(MINMAXINFO*)lp;p->ptMinTrackSize.x=960;p->ptMinTrackSize.y=635;return 0;
     }
     case WM_SIZE:Relayout();return 0;
+    case WM_PLAYER_EVENT:{
+        auto eventType=(MFP_EVENT_TYPE)wp;
+        IMFPMediaPlayer* source=(IMFPMediaPlayer*)lp;
+        if(source==g_player && g_player){
+            if(eventType==MFP_EVENT_TYPE_MEDIAITEM_SET){
+                g_playerReady=true;
+                g_player->SetAspectRatioMode(MFVideoARMode_PreservePicture);
+                SIZE native={},aspectCorrected={};
+                if(SUCCEEDED(g_player->GetNativeVideoSize(&native,&aspectCorrected))){
+                    if(aspectCorrected.cx>0&&aspectCorrected.cy>0){
+                        g_previewWidth=(UINT32)aspectCorrected.cx;
+                        g_previewHeight=(UINT32)aspectCorrected.cy;
+                    }
+                }
+                Relayout();
+                ClipPosition at=LocateClip(g_kept,g_cursor);
+                if(at.index>=0)SetPlayerPosition(g_player,at.source);
+                if(g_userWantsPlay)StartPlayback();
+                else BeginStillPreview();
+            }else if(eventType==MFP_EVENT_TYPE_PLAYBACK_ENDED && !g_previewPriming){
+                g_playing=false;g_userWantsPlay=false;
+                if(g_audioPlayer)g_audioPlayer->Pause();
+                UpdatePlayButton();
+            }
+        }else if(source==g_audioPlayer && g_audioPlayer){
+            if(eventType==MFP_EVENT_TYPE_MEDIAITEM_SET){
+                g_audioReady=true;
+                ClipPosition a=LocateClip(g_audioKept,g_cursor);
+                if(a.index>=0){
+                    SetPlayerPosition(g_audioPlayer,a.source);
+                    if(g_playing)g_audioPlayer->Play();
+                }
+            }
+        }
+        return 0;
+    }
     case WM_DROPFILES:{
         HDROP drop=(HDROP)wp;wchar_t p[MAX_PATH]={};
         if(DragQueryFileW(drop,0,p,MAX_PATH))OpenFile(p);
@@ -960,21 +997,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
             InvalidateRect(g_noAudio,nullptr,TRUE);
             Status(g_muteOriginal?L"Оригинальный звук отключён. Загруженное аудио останется.":L"Оригинальный звук включён.");
             break;
-        case ID_PLAY:
-            if(g_player){
-                if(g_playing){
-                    g_player->Pause();
-                    if(g_audioPlayer)g_audioPlayer->Pause();
-                    g_playing=false;
-                }else{
-                    if(g_cursor>=MontageDuration())SeekTo(0);
-                    if(SUCCEEDED(g_player->Play())){
-                        g_playing=true;
-                        ClipPosition a=LocateClip(g_audioKept,g_cursor);
-                        if(g_audioPlayer&&a.index>=0)g_audioPlayer->Play();
-                    }
-                }
-            }break;
+        case ID_PLAY:TogglePlayback();break;
         case ID_SPLIT:SplitHere();break;
         case ID_REMOVE:RemoveSelected();break;
         case ID_TRIM_START:if(!g_file.empty()&&!g_exporting)RemoveInterval(0,g_cursor);break;
@@ -986,6 +1009,27 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         return 0;
     }
     case WM_TIMER:{
+        if(g_previewPriming && g_playerReady && g_player){
+            ULONGLONG elapsed=GetTickCount64()-g_primeSince;
+            PROPVARIANT pos;PropVariantInit(&pos);
+            bool moved=false;
+            if(SUCCEEDED(g_player->GetPosition(MFP_POSITIONTYPE_100NS,&pos))&&pos.vt==VT_I8){
+                LONGLONG position=pos.hVal.QuadPart;
+                moved=position>=g_primeSource+HNS/40 &&
+                      position<=g_primeSource+2*HNS;
+            }
+            PropVariantClear(&pos);
+            if((elapsed>=110 && moved)||elapsed>=520){
+                // The first frame has reached the renderer; freeze it without
+                // ever requiring the user to press Play to initialize MFPlay.
+                g_previewPriming=false;
+                g_player->Pause();
+                g_player->SetVolume(g_muteOriginal?0.0f:1.0f);
+                if(g_video)InvalidateRect(g_video,nullptr,FALSE);
+                g_player->UpdateVideo();
+                UpdatePlayButton();
+            }
+        }
         if(g_exporting){
             ++g_spinnerStep;
             RECT spinner=SpinnerRect();
@@ -1006,6 +1050,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                         g_player->Pause();
                         if(g_audioPlayer)g_audioPlayer->Pause();
                         g_playing=false;g_cursor=MontageDuration();
+                        UpdatePlayButton();
                     }else SeekTo(next,true);
                 }else if(source>=clip.first){
                     g_cursor=startOffset+source-clip.first;
