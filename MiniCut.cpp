@@ -407,6 +407,7 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
         if(hasAudio)Check(reader->SetStreamSelection(MF_SOURCE_READER_FIRST_AUDIO_STREAM,TRUE),L"Выбор звуковой дорожки");
 
         ComPtr<IMFMediaType> videoInput,videoOutput;
+        UINT32 frameW=0,frameH=0;
         if(exact){
             Check(MFCreateMediaType(videoInput.put()),L"Формат декодирования");
             Check(videoInput->SetGUID(MF_MT_MAJOR_TYPE,MFMediaType_Video),L"Видео тип");
@@ -416,7 +417,6 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
             Check(reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,videoInput.put()),L"Получение типа NV12");
             // Normalize packed stride for H264 encoder. Decoder's NV12 buffers may
             // have padded rows and must not be forwarded unchanged.
-            UINT32 frameW=0,frameH=0;
             Check(MFGetAttributeSize(videoInput.get(),MF_MT_FRAME_SIZE,&frameW,&frameH),L"Размер видеокадра");
             Check(MFCreateMediaType(videoOutput.put()),L"Формат H.264");
             Check(videoOutput->SetGUID(MF_MT_MAJOR_TYPE,MFMediaType_Video),L"Видео тип H.264");
@@ -740,6 +740,34 @@ std::wstring AudioFileDialog(){
     return GetOpenFileNameW(&d)?std::wstring(path):std::wstring();
 }
 
+RECT SpinnerRect(){
+    if(!g_window)return {0,0,0,0};
+    RECT client;GetClientRect(g_window,&client);
+    return {client.right-270,8,client.right-8,49};
+}
+void DrawExportSpinner(HDC dc){
+    if(!g_exporting)return;
+    RECT area=SpinnerRect();
+    SetBkMode(dc,TRANSPARENT);
+    SetTextColor(dc,RGB(232,239,247));
+    std::wstring caption=L"Экспорт: "+(g_exportPercent>=0
+        ?std::to_wstring(g_exportPercent)+L"%":std::wstring(L"подготовка"));
+    RECT label={area.left,area.top,area.right-49,area.bottom};
+    DrawTextW(dc,caption.c_str(),-1,&label,DT_SINGLELINE|DT_RIGHT|DT_VCENTER);
+    int cx=area.right-24,cy=(area.top+area.bottom)/2;
+    constexpr double PI=3.141592653589793;
+    for(int i=0;i<12;++i){
+        double angle=(2.0*PI*i)/12.0;
+        int x=cx+(int)(12.0*std::cos(angle));
+        int y=cy+(int)(12.0*std::sin(angle));
+        int glow=(i+12-g_spinnerStep%12)%12;
+        int v=75+(11-glow)*15;
+        HBRUSH dot=CreateSolidBrush(RGB(v>240?240:v, v>240?240:v, 255));
+        HGDIOBJ old=SelectObject(dc,dot);
+        Ellipse(dc,x-3,y-3,x+4,y+4);
+        SelectObject(dc,old);DeleteObject(dot);
+    }
+}
 LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     switch(msg){
     case WM_CREATE:{
@@ -871,6 +899,11 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         return 0;
     }
     case WM_TIMER:{
+        if(g_exporting){
+            ++g_spinnerStep;
+            RECT spinner=SpinnerRect();
+            InvalidateRect(hwnd,&spinner,FALSE);
+        }
         if(!g_player||!g_playing||g_previewClip<0)break;
         PROPVARIANT pos;PropVariantInit(&pos);
         if(SUCCEEDED(g_player->GetPosition(MFP_POSITIONTYPE_100NS,&pos))&&pos.vt==VT_I8){
@@ -908,7 +941,11 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_EXPORT_PROGRESS:
         if(wp==1001){Status(L"Предпросмотр: Media Foundation сообщила об ошибке.");}
-        else if(g_exporting){Status(L"Экспорт: "+std::to_wstring(wp)+L"% …");}
+        else if(g_exporting){
+            g_exportPercent=(int)wp;
+            Status(L"Экспорт: "+std::to_wstring(wp)+L"% …");
+            RECT spinner=SpinnerRect();InvalidateRect(hwnd,&spinner,FALSE);
+        }
         return 0;
     case WM_EXPORT_DONE:{
         std::unique_ptr<ExportResult> r((ExportResult*)lp);
@@ -951,6 +988,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         RECT title={20,16,client.right-20,45};
         DrawTextW(dc,L"MiniCut",-1,&title,DT_SINGLELINE|DT_VCENTER);
         if(g_duration){DrawTimeline(dc);}
+        DrawExportSpinner(dc);
         SelectObject(dc,previous);EndPaint(hwnd,&ps);return 0;
     }
     case WM_CLOSE:
@@ -986,7 +1024,20 @@ int APIENTRY wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show){
         nullptr,nullptr,instance,nullptr);
     if(!g_window){MFShutdown();CoUninitialize();return 3;}
     ShowWindow(g_window,show);UpdateWindow(g_window);
+    // Accelerators are routed even if a child button has the keyboard focus.
+    // Do not register global hotkeys: Delete/Ctrl+Z should work ONLY in MiniCut.
+    ACCEL shortcuts[2]={};
+    shortcuts[0].fVirt=FVIRTKEY|FCONTROL;
+    shortcuts[0].key='Z';shortcuts[0].cmd=ID_UNDO;
+    shortcuts[1].fVirt=FVIRTKEY;
+    shortcuts[1].key=VK_DELETE;shortcuts[1].cmd=ID_REMOVE;
+    HACCEL accelerators=CreateAcceleratorTableW(shortcuts,2);
     MSG msg;
-    while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}
+    while(GetMessageW(&msg,nullptr,0,0)>0){
+        if(!accelerators||!TranslateAcceleratorW(g_window,accelerators,&msg)){
+            TranslateMessage(&msg);DispatchMessageW(&msg);
+        }
+    }
+    if(accelerators)DestroyAcceleratorTable(accelerators);
     MFShutdown();CoUninitialize();return (int)msg.wParam;
 }
