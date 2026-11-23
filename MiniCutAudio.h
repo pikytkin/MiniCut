@@ -46,12 +46,9 @@ void ConfigureMixedAAC(IMFSinkWriter* writer,DWORD& streamIndex){
 void MixSourcePCM(const std::wstring& sourcePath,const std::vector<Span>& spans,
                   std::vector<int32_t>& mix){
     if(spans.empty()||sourcePath.empty()||mix.empty())return;
-    ComPtr<IMFAttributes> attr;
-    Check(MFCreateAttributes(attr.put(),2),L"Настройки аудиодекодера");
-    // Allow Windows Media Foundation to resample and remix input to 48 kHz stereo.
-    Check(attr->SetUINT32(MF_SOURCE_READER_ENABLE_AUDIO_PROCESSING,TRUE),L"Преобразование звука");
+    // Source Reader installs audio decoders / resamplers when PCM is requested.
     ComPtr<IMFSourceReader> reader;
-    Check(MFCreateSourceReaderFromURL(sourcePath.c_str(),attr.get(),reader.put()),L"Открытие аудио");
+    Check(MFCreateSourceReaderFromURL(sourcePath.c_str(),nullptr,reader.put()),L"Открытие аудио");
     Check(reader->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS,FALSE),L"Аудиопотоки");
     Check(reader->SetStreamSelection(MF_SOURCE_READER_FIRST_AUDIO_STREAM,TRUE),L"Выбор аудио");
     ComPtr<IMFMediaType> pcm;
