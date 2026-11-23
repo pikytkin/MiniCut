@@ -24,6 +24,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -43,7 +44,7 @@ constexpr UINT WM_EXPORT_DONE = WM_APP + 10;
 constexpr UINT WM_EXPORT_PROGRESS = WM_APP + 11;
 constexpr int ID_OPEN=100, ID_PLAY=101, ID_SPLIT=102, ID_REMOVE=103,
     ID_TRIM_START=104, ID_TRIM_END=105, ID_UNDO=106, ID_FAST=107, ID_EXACT=108,
-    ID_NO_AUDIO=109;
+    ID_NO_AUDIO=109, ID_LOAD_AUDIO=110;
 
 template <typename T> struct ComPtr {
     T* p = nullptr;
@@ -76,30 +77,39 @@ std::wstring TimeLabel(LONGLONG t) {
     return b;
 }
 
-HWND g_window=nullptr,g_video=nullptr,g_status=nullptr,g_time=nullptr,g_noAudio=nullptr;
+HWND g_window=nullptr,g_video=nullptr,g_status=nullptr,g_time=nullptr,g_noAudio=nullptr,g_loadAudio=nullptr;
 HWND g_buttons[9]={};
 HFONT g_font=nullptr;
 IMFPMediaPlayer* g_player=nullptr;
-std::wstring g_file;
-std::vector<Span> g_kept;
-std::vector<std::vector<Span>> g_history;
-LONGLONG g_duration=0,g_cursor=0,g_dragStart=0,g_dragEnd=0;
-int g_selected=-1;
-bool g_playing=false,g_mouseDown=false,g_dragging=false,g_exporting=false;
-bool g_clipMouseDown=false,g_clipDragging=false;
+IMFPMediaPlayer* g_audioPlayer=nullptr;
+std::wstring g_file,g_audioFile;
+std::vector<Span> g_kept,g_audioKept;
+struct EditState {
+    std::vector<Span> video,audio;
+    int videoSelected=-1,audioSelected=-1;
+    bool focusAudio=false;
+};
+std::vector<EditState> g_history;
+LONGLONG g_duration=0,g_audioDuration=0,g_cursor=0,g_dragStart=0,g_dragEnd=0;
+int g_selected=-1,g_selectedAudio=-1,g_previewClip=-1,g_previewAudioClip=-1;
+bool g_playing=false,g_dragging=false,g_exporting=false,g_muteOriginal=false;
+bool g_clipMouseDown=false,g_clipDragging=false,g_dragAudio=false,g_focusAudio=false,g_rangeSelect=false;
 int g_dragClipIndex=-1,g_insertSlot=0;
 POINT g_mousePt={};
-RECT g_track={},g_montageTrack={};
+RECT g_montageTrack={},g_audioTrack={};
+LONGLONG MontageDuration();
+int MontageX(LONGLONG t);
 
 void Status(const std::wstring& text) { if(g_status) SetWindowTextW(g_status,text.c_str()); }
 void ShowFail(const wchar_t* title, const std::wstring& detail) {
     MessageBoxW(g_window,detail.c_str(),title,MB_OK|MB_ICONERROR);
 }
-void RedrawTrack() { if(g_window){InvalidateRect(g_window,&g_track,FALSE);InvalidateRect(g_window,&g_montageTrack,FALSE);} }
+void RedrawTrack() { if(g_window){InvalidateRect(g_window,&g_montageTrack,FALSE);InvalidateRect(g_window,&g_audioTrack,FALSE);} }
 void SetUIBusy(bool busy) {
     g_exporting=busy;
     for(auto& b:g_buttons) if(b) EnableWindow(b,!busy);
     if(g_noAudio)EnableWindow(g_noAudio,!busy);
+    if(g_loadAudio)EnableWindow(g_loadAudio,!busy);
 }
 
 class PlayerCallback final:public IMFPMediaPlayerCallback {
@@ -126,20 +136,56 @@ public:
 };
 PlayerCallback* g_callback=nullptr;
 
+struct ClipPosition {
+    int index=-1;
+    LONGLONG source=0,offset=0;
+};
+LONGLONG ClipsDuration(const std::vector<Span>& clips){
+    LONGLONG total=0;
+    for(const Span& p:clips)total+=p.last-p.first;
+    return total;
+}
+ClipPosition LocateClip(const std::vector<Span>& clips,LONGLONG t){
+    LONGLONG offset=0;
+    for(int i=0;i<(int)clips.size();++i){
+        const Span& s=clips[i];
+        LONGLONG length=s.last-s.first;
+        if(t<offset+length)
+            return {i,s.first+std::max(0LL,t-offset),offset};
+        offset+=length;
+    }
+    return {-1,0,offset};
+}
+void StopAudioPlayer(){
+    if(g_audioPlayer){g_audioPlayer->Shutdown();g_audioPlayer->Release();g_audioPlayer=nullptr;}
+    g_previewAudioClip=-1;
+}
 void StopPlayer() {
     g_playing=false;
-    if(g_player) {
-        g_player->Shutdown();g_player->Release();g_player=nullptr;
-    }
+    StopAudioPlayer();
+    if(g_player){g_player->Shutdown();g_player->Release();g_player=nullptr;}
+    g_previewClip=-1;
+}
+void SetPlayerPosition(IMFPMediaPlayer* player,LONGLONG time){
+    if(!player)return;
+    PROPVARIANT pos;PropVariantInit(&pos);
+    pos.vt=VT_I8;pos.hVal.QuadPart=std::max(0LL,time);
+    player->SetPosition(MFP_POSITIONTYPE_100NS,&pos);
 }
 void SeekTo(LONGLONG t) {
-    g_cursor=ClampTime(t,g_duration);
-    if(g_player) {
-        PROPVARIANT pos;PropVariantInit(&pos);
-        pos.vt=VT_I8;pos.hVal.QuadPart=g_cursor;
-        g_player->SetPosition(MFP_POSITIONTYPE_100NS,&pos);
+    g_cursor=ClampTime(t,MontageDuration());
+    ClipPosition v=LocateClip(g_kept,g_cursor);
+    g_previewClip=v.index;
+    if(g_player&&v.index>=0)SetPlayerPosition(g_player,v.source);
+    ClipPosition a=LocateClip(g_audioKept,g_cursor);
+    g_previewAudioClip=a.index;
+    if(g_audioPlayer){
+        if(a.index>=0){
+            SetPlayerPosition(g_audioPlayer,a.source);
+            if(g_playing)g_audioPlayer->Play();
+        }else g_audioPlayer->Pause();
     }
-    if(g_time) SetWindowTextW(g_time,(TimeLabel(g_cursor)+L" / "+TimeLabel(g_duration)).c_str());
+    if(g_time)SetWindowTextW(g_time,(TimeLabel(g_cursor)+L" / "+TimeLabel(MontageDuration())).c_str());
     RedrawTrack();
 }
 void OpenFile(const std::wstring& file) {
@@ -160,66 +206,106 @@ void OpenFile(const std::wstring& file) {
         if(newDuration<=0)throw MediaError{E_INVALIDARG,L"Видео пустое"};
         StopPlayer();
         g_file=file;g_duration=newDuration;g_cursor=0;
-        g_kept={{0,g_duration}};g_history.clear();g_selected=0;
-        g_mouseDown=false;g_clipMouseDown=false;g_clipDragging=false;g_dragging=false;
+        g_audioFile.clear();g_audioKept.clear();g_audioDuration=0;
+        g_kept={{0,g_duration}};g_history.clear();g_selected=0;g_selectedAudio=-1;
+        g_clipMouseDown=false;g_clipDragging=false;g_dragging=false;g_focusAudio=false;
         if(!g_callback)g_callback=new PlayerCallback();
         HRESULT hr=MFPCreateMediaPlayer(file.c_str(),FALSE,0,g_callback,g_video,&g_player);
-        if(FAILED(hr)) {g_player=nullptr;Status(L"Видео загружено, но предпросмотр недоступен");}
-        else Status(L"Шкала «Исходник» — разрез и выделение; части на дорожке «Монтаж» можно перетаскивать.");
+        if(FAILED(hr)){g_player=nullptr;Status(L"Видео загружено, но предпросмотр недоступен");}
+        else Status(L"Перетаскивайте клипы мышью. Shift+протяжка — выделить диапазон для удаления.");
         SetWindowTextW(g_window,(L"MiniCut — "+file).c_str());
-        SeekTo(0);
-        InvalidateRect(g_window,nullptr,FALSE);
+        if(g_player)g_player->SetVolume(g_muteOriginal?0.0f:1.0f);
+        SeekTo(0);InvalidateRect(g_window,nullptr,FALSE);
     }catch(const MediaError& e){ShowFail(L"Открытие файла",ErrorText(e));}
 }
-
-int SpanAt(LONGLONG t) {
-    for(int i=0;i<(int)g_kept.size();++i) {
-        if(t>=g_kept[i].first&&t<g_kept[i].last)return i;
-    }
-    return -1;
+void OpenAudioFile(const std::wstring& file){
+    if(g_exporting||g_file.empty())return;
+    try{
+        ComPtr<IMFSourceReader> source;
+        Check(MFCreateSourceReaderFromURL(file.c_str(),nullptr,source.put()),L"Не удалось открыть аудио");
+        ComPtr<IMFMediaType> type;
+        Check(source->GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM,0,type.put()),L"Аудиодорожка не найдена");
+        PROPVARIANT duration;PropVariantInit(&duration);
+        Check(source->GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE,MF_PD_DURATION,&duration),
+              L"Не удалось определить длину аудио");
+        LONGLONG len=(LONGLONG)duration.uhVal.QuadPart;
+        PropVariantClear(&duration);
+        if(len<=0)throw MediaError{E_INVALIDARG,L"Аудиофайл пуст"};
+        StopAudioPlayer();
+        g_audioFile=file;g_audioDuration=len;
+        // Separate audio timeline starts at zero; extra material beyond the video is ignored.
+        g_audioKept={{0,std::min(len,MontageDuration())}};
+        g_selectedAudio=0;g_focusAudio=true;g_dragging=false;g_history.clear();
+        if(!g_callback)g_callback=new PlayerCallback();
+        HRESULT hr=MFPCreateMediaPlayer(file.c_str(),FALSE,0,g_callback,nullptr,&g_audioPlayer);
+        if(FAILED(hr)){g_audioPlayer=nullptr;Status(L"Аудио загружено для экспорта, но предпросмотр звука недоступен.");}
+        else Status(L"Аудио добавлено. Его можно разрезать, удалять и переставлять отдельно.");
+        SeekTo(g_cursor);
+    }catch(const MediaError& e){ShowFail(L"Открытие аудио",ErrorText(e));}
 }
-void Remember() {
-    g_history.push_back(g_kept);
-    if(g_history.size()>40)g_history.erase(g_history.begin());
+
+void Remember(){
+    g_history.push_back({g_kept,g_audioKept,g_selected,g_selectedAudio,g_focusAudio});
+    if(g_history.size()>50)g_history.erase(g_history.begin());
 }
 void NormalizeSelection(){
     if(g_selected>=(int)g_kept.size())g_selected=(int)g_kept.size()-1;
+    if(g_selectedAudio>=(int)g_audioKept.size())g_selectedAudio=(int)g_audioKept.size()-1;
     if(g_selected<0&&!g_kept.empty())g_selected=0;
+    if(g_selectedAudio<0&&!g_audioKept.empty())g_selectedAudio=0;
 }
 void RemoveInterval(LONGLONG a,LONGLONG b){
+    if(g_exporting)return;
     if(a>b)std::swap(a,b);
     if(b-a<HNS/100)return;
     Remember();
+    auto& parts=g_focusAudio?g_audioKept:g_kept;
     std::vector<Span> rest;
-    for(const auto& part:g_kept) {
-        if(part.last<=a||part.first>=b){rest.push_back(part);continue;}
-        if(part.first<a)rest.push_back({part.first,a});
-        if(part.last>b)rest.push_back({b,part.last});
+    LONGLONG offset=0;
+    for(const Span& part:parts){
+        LONGLONG len=part.last-part.first;
+        LONGLONG localA=std::max(0LL,std::min(len,a-offset));
+        LONGLONG localB=std::max(0LL,std::min(len,b-offset));
+        if(localA>0)rest.push_back({part.first,part.first+localA});
+        if(localB<len)rest.push_back({part.first+localB,part.last});
+        offset+=len;
     }
-    g_kept=std::move(rest);NormalizeSelection();
-    g_dragging=false;Status(L"Фрагмент удалён. Ctrl+Z — отмена.");RedrawTrack();
+    parts=std::move(rest);NormalizeSelection();
+    g_dragging=false;
+    SeekTo(std::min(a,MontageDuration()));
+    Status(g_focusAudio?L"Удалён аудиодиапазон. Ctrl+Z — отмена.":L"Удалён видеофрагмент. Ctrl+Z — отмена.");
 }
 void SplitHere(){
     if(g_file.empty()||g_exporting)return;
-    int idx=SpanAt(g_cursor);
-    if(idx<0||g_cursor<=g_kept[idx].first+HNS/100||g_cursor>=g_kept[idx].last-HNS/100)return;
+    auto& parts=g_focusAudio?g_audioKept:g_kept;
+    ClipPosition at=LocateClip(parts,g_cursor);
+    if(at.index<0||at.source<=parts[at.index].first+HNS/100||
+       at.source>=parts[at.index].last-HNS/100)return;
     Remember();
-    Span old=g_kept[idx];g_kept[idx].last=g_cursor;
-    g_kept.insert(g_kept.begin()+idx+1,{g_cursor,old.last});
-    g_selected=idx+1;Status(L"Разрезано. Перетащите часть в «Монтаже» или нажмите «Удалить».");RedrawTrack();
+    Span old=parts[at.index];parts[at.index].last=at.source;
+    parts.insert(parts.begin()+at.index+1,{at.source,old.last});
+    if(g_focusAudio)g_selectedAudio=at.index+1;else g_selected=at.index+1;
+    Status(g_focusAudio?L"Аудиофрагмент разрезан.":L"Видео разрезано. Перетащите часть мышью.");
+    RedrawTrack();
 }
 void RemoveSelected(){
     if(g_file.empty()||g_exporting)return;
     if(g_dragging){RemoveInterval(g_dragStart,g_dragEnd);return;}
-    if(g_selected>=0&&g_selected<(int)g_kept.size()){
-        Remember();g_kept.erase(g_kept.begin()+g_selected);
-        NormalizeSelection();Status(L"Фрагмент удалён. Ctrl+Z — отмена.");RedrawTrack();
+    auto& parts=g_focusAudio?g_audioKept:g_kept;
+    int selected=g_focusAudio?g_selectedAudio:g_selected;
+    if(selected>=0&&selected<(int)parts.size()){
+        Remember();parts.erase(parts.begin()+selected);
+        NormalizeSelection();SeekTo(std::min(g_cursor,MontageDuration()));
+        Status(g_focusAudio?L"Аудиофрагмент удалён. Ctrl+Z — отмена.":L"Видеофрагмент удалён. Ctrl+Z — отмена.");
     }
 }
 void Undo(){
     if(g_history.empty()||g_exporting)return;
-    g_kept=g_history.back();g_history.pop_back();NormalizeSelection();
-    g_dragging=false;Status(L"Действие отменено.");RedrawTrack();
+    EditState x=std::move(g_history.back());g_history.pop_back();
+    g_kept=std::move(x.video);g_audioKept=std::move(x.audio);
+    g_selected=x.videoSelected;g_selectedAudio=x.audioSelected;g_focusAudio=x.focusAudio;
+    NormalizeSelection();g_dragging=false;
+    SeekTo(std::min(g_cursor,MontageDuration()));Status(L"Действие отменено.");
 }
 
 // A sample's true codec keyframe (CleanPoint) is required for stream-copy cuts.
@@ -253,13 +339,14 @@ void CopyAttribute(IMFAttributes* from,IMFAttributes* to,const GUID& guid) {
     if(SUCCEEDED(from->GetItem(guid,&p))) {to->SetItem(guid,p);PropVariantClear(&p);}
 }
 
-// Two distinct paths:
-// FAST: source compressed H264+AAC -> sink identical compressed formats (remux).
-// EXACT: source decodes video to NV12 -> Windows H264 encoder; audio is copied AAC.
-// Audio start/end precision in EXACT remains limited to individual AAC packets.
+#include "MiniCutAudio.h"
+// FAST remuxes H.264; EXACT decodes video to RGB32 before encoding.
+// Imported audio is mixed with original audio in PCM and encoded to AAC.
+
 struct ExportResult {bool ok=false;std::wstring message;};
 void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<Span> spans,
-                 LONGLONG duration,bool exact,bool muteAudio){
+                 LONGLONG duration,bool exact,bool muteAudio,
+                 std::wstring externalAudio,std::vector<Span> audioSpans){
     ExportResult* result=new ExportResult();
     HRESULT co=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
     bool coOk=SUCCEEDED(co);
@@ -267,7 +354,13 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
     try {
         Check(MFStartup(MF_VERSION),L"Инициализация Media Foundation"); mfOk=true;
         ComPtr<IMFSourceReader> reader;
-        Check(MFCreateSourceReaderFromURL(input.c_str(),nullptr,reader.put()),L"Открытие исходного файла");
+        ComPtr<IMFAttributes> readerAttrs;
+        if(exact){
+            Check(MFCreateAttributes(readerAttrs.put(),2),L"Настройки видеодекодера");
+            Check(readerAttrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,TRUE),
+                  L"Цветовое преобразование кадров");
+        }
+        Check(MFCreateSourceReaderFromURL(input.c_str(),readerAttrs.get(),reader.put()),L"Открытие исходного файла");
         ComPtr<IMFMediaType> nativeVideo,nativeAudio;
         Check(reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,0,nativeVideo.put()),L"Видео дорожка не найдена");
         GUID videoSubtype={};
@@ -275,7 +368,8 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
         if(!exact&&videoSubtype!=MFVideoFormat_H264)
             throw MediaError{MF_E_INVALIDMEDIATYPE,L"Быстрый экспорт поддерживает только H.264"};
 
-        bool hasAudio=!muteAudio &&
+        bool mixAudio=!externalAudio.empty();
+        bool hasAudio=!muteAudio && !mixAudio &&
             SUCCEEDED(reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM,0,nativeAudio.put()));
         if(hasAudio){
             GUID audioSubtype={};
@@ -302,16 +396,20 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
         if(exact){
             Check(MFCreateMediaType(videoInput.put()),L"Формат декодирования");
             Check(videoInput->SetGUID(MF_MT_MAJOR_TYPE,MFMediaType_Video),L"Видео тип");
-            Check(videoInput->SetGUID(MF_MT_SUBTYPE,MFVideoFormat_NV12),L"NV12");
-            Check(reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,nullptr,videoInput.get()),L"Декодирование видео в NV12");
+            Check(videoInput->SetGUID(MF_MT_SUBTYPE,MFVideoFormat_RGB32),L"RGB32");
+            Check(reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,nullptr,videoInput.get()),L"Цветовое преобразование видео в RGB32");
             videoInput.reset();
-            Check(reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,videoInput.put()),L"Получение параметров NV12");
+            Check(reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,videoInput.put()),L"Получение параметров RGB32");
             Check(MFCreateMediaType(videoOutput.put()),L"Формат H.264");
             Check(videoOutput->SetGUID(MF_MT_MAJOR_TYPE,MFMediaType_Video),L"Видео тип H.264");
             Check(videoOutput->SetGUID(MF_MT_SUBTYPE,MFVideoFormat_H264),L"Видеокодек H.264");
             CopyAttribute(nativeVideo.get(),videoOutput.get(),MF_MT_FRAME_SIZE);
             CopyAttribute(nativeVideo.get(),videoOutput.get(),MF_MT_FRAME_RATE);
             CopyAttribute(nativeVideo.get(),videoOutput.get(),MF_MT_PIXEL_ASPECT_RATIO);
+            CopyAttribute(nativeVideo.get(),videoOutput.get(),MF_MT_VIDEO_PRIMARIES);
+            CopyAttribute(nativeVideo.get(),videoOutput.get(),MF_MT_TRANSFER_FUNCTION);
+            CopyAttribute(nativeVideo.get(),videoOutput.get(),MF_MT_YUV_MATRIX);
+            CopyAttribute(nativeVideo.get(),videoOutput.get(),MF_MT_VIDEO_NOMINAL_RANGE);
             videoOutput->SetUINT32(MF_MT_INTERLACE_MODE,MFVideoInterlace_Progressive);
             UINT32 bitrate=4000000;
             nativeVideo->GetUINT32(MF_MT_AVG_BITRATE,&bitrate);
@@ -327,14 +425,26 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
         DWORD videoStream=0,audioStream=0;
         Check(writer->AddStream(videoOutput.get(),&videoStream),L"Добавление видео дорожки");
         Check(writer->SetInputMediaType(videoStream,videoInput.get(),nullptr),L"Настройка видеокодека");
-        if(hasAudio){
+        if(mixAudio)ConfigureMixedAAC(writer.get(),audioStream);
+        else if(hasAudio){
             Check(writer->AddStream(nativeAudio.get(),&audioStream),L"Добавление аудио дорожки");
             Check(writer->SetInputMediaType(audioStream,nativeAudio.get(),nullptr),L"Настройка AAC");
         }
-        Check(writer->BeginWriting(),L"Начало записи MP4");
         LONGLONG total=0;
         for(auto s:spans)total+=s.last-s.first;
         if(total<=0)throw MediaError{E_INVALIDARG,L"Нет фрагментов для сохранения"};
+        std::vector<int32_t> mixedPCM;
+        if(mixAudio){
+            const LONGLONG frames=AudioFrames(total);
+            if(frames>(LONGLONG)MIX_RATE*60*30)
+                throw MediaError{E_OUTOFMEMORY,L"Смешивание аудио ограничено 30 минутами"};
+            mixedPCM.resize((size_t)frames*MIX_CHANNELS,0);
+            if(!muteAudio && FileHasAudio(input))MixSourcePCM(input,spans,mixedPCM);
+            MixSourcePCM(externalAudio,audioSpans,mixedPCM);
+        }
+        Check(writer->BeginWriting(),L"Начало записи MP4");
+        LONGLONG audioWritten=0;
+        if(mixAudio)WriteMixedAudioUntil(writer.get(),audioStream,mixedPCM,audioWritten,HNS/5);
         LONGLONG offset=0;
         int lastPct=-1;
         for(const Span& part:spans){
@@ -371,23 +481,28 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
                 if(SUCCEEDED(sample->GetSampleDuration(&sampleLength))&&sampleLength>0 && t+sampleLength>part.last)
                     sample->SetSampleDuration(part.last-t);
                 UINT64 decode=0;
-                if(SUCCEEDED(sample->GetUINT64(MFSampleExtension_DecodeTimestamp,&decode))){
+                if(!exact && SUCCEEDED(sample->GetUINT64(MFSampleExtension_DecodeTimestamp,&decode))){
                     const LONGLONG adjusted=offset+((LONGLONG)decode-part.first);
                     if(adjusted>=0)sample->SetUINT64(MFSampleExtension_DecodeTimestamp,(UINT64)adjusted);
                 }
                 if(isVideo&&firstVideo){sample->SetUINT32(MFSampleExtension_Discontinuity,TRUE);firstVideo=false;}
                 if(isAudio&&firstAudio){sample->SetUINT32(MFSampleExtension_Discontinuity,TRUE);firstAudio=false;}
+                if(mixAudio && isVideo)
+                    WriteMixedAudioUntil(writer.get(),audioStream,mixedPCM,audioWritten,newTime+HNS/5);
                 Check(writer->WriteSample(isVideo?videoStream:audioStream,sample.get()),L"Запись кадра/звука");
                 int pct=(int)(100.0*(double)(offset+std::min(t-part.first,part.last-part.first))/(double)total);
                 if(pct!=lastPct){lastPct=pct;PostMessageW(notify,WM_EXPORT_PROGRESS,pct,0);}
             }
             offset+=part.last-part.first;
         }
+        if(mixAudio)WriteMixedAudioUntil(writer.get(),audioStream,mixedPCM,audioWritten,total);
         Check(writer->Finalize(),L"Завершение MP4");
         result->ok=true;
-        result->message=muteAudio ?
-            (exact?L"Точный экспорт завершён. Видео H.264 без звуковой дорожки.":L"Быстрый экспорт завершён. Видео без звука (по ключевым кадрам).") :
-            (exact?L"Точный экспорт завершён. Видео H.264, звук AAC сохранён.":L"Быстрый экспорт завершён. Потоки сохранены без перекодирования (границы по ключевым кадрам).");
+        result->message=mixAudio?
+            L"Готово. Видео и монтажная аудиодорожка сохранены в MP4 (AAC).":
+            (muteAudio?L"Готово. Оригинальный звук отключён.":
+            (exact?L"Точный экспорт завершён. Видео H.264, звук AAC сохранён.":
+                   L"Быстрый экспорт завершён. Потоки сохранены без перекодирования."));
     }catch(const MediaError& e){result->message=ErrorText(e);}
     catch(...){result->message=L"Неизвестная ошибка экспорта";}
     if(!result->ok)DeleteFileW(output.c_str());
@@ -416,163 +531,177 @@ void StartExport(bool exact){
     if(_wcsicmp(output.c_str(),g_file.c_str())==0){
         ShowFail(L"Сохранение",L"Нельзя перезаписывать исходное видео. Выберите другой файл.");return;
     }
-    bool muteAudio=g_noAudio && SendMessageW(g_noAudio,BM_GETCHECK,0,0)==BST_CHECKED;
+    bool muteAudio=g_muteOriginal;
     SetUIBusy(true);
     Status(exact?L"Точный экспорт: кодирование кадр за кадром…":L"Быстрый экспорт: поиск ключевых кадров…");
-    std::thread([win=g_window,src=g_file,dst=output,parts=g_kept,len=g_duration,exact,muteAudio](){
-        ExportVideo(win,src,dst,parts,len,exact,muteAudio);
+    std::thread([win=g_window,src=g_file,dst=output,parts=g_kept,len=g_duration,exact,muteAudio,
+                 audio=g_audioFile,audioParts=g_audioKept](){
+        ExportVideo(win,src,dst,parts,len,exact,muteAudio,audio,audioParts);
     }).detach();
 }
 
 
-LONGLONG MontageDuration(){
-    LONGLONG sum=0;
-    for(const Span& span:g_kept)sum+=std::max(0LL,span.last-span.first);
-    return sum;
-}
+LONGLONG MontageDuration(){return ClipsDuration(g_kept);}
 int MontageX(LONGLONG offset){
     LONGLONG total=MontageDuration();
     if(total<=0)return g_montageTrack.left;
-    double f=(double)offset/(double)total;
-    return g_montageTrack.left+(int)(f*(g_montageTrack.right-g_montageTrack.left));
+    return g_montageTrack.left+(int)((double)offset/total*(g_montageTrack.right-g_montageTrack.left));
 }
-RECT MontageClipRect(size_t index){
+LONGLONG PositionFromX(int x){
+    int width=std::max(1,static_cast<int>(g_montageTrack.right-g_montageTrack.left));
+    double fraction=std::max(0.0,std::min(1.0,(double)(x-g_montageTrack.left)/width));
+    return ClampTime((LONGLONG)(fraction*MontageDuration()),MontageDuration());
+}
+RECT ClipRect(const std::vector<Span>& clips,size_t index,RECT row){
     LONGLONG offset=0;
-    for(size_t i=0;i<index && i<g_kept.size();++i)
-        offset+=g_kept[i].last-g_kept[i].first;
+    for(size_t i=0;i<index&&i<clips.size();++i)offset+=clips[i].last-clips[i].first;
     int left=MontageX(offset);
-    if(index>=g_kept.size())
-        return {left,g_montageTrack.top,g_montageTrack.right,g_montageTrack.bottom};
-    int right=MontageX(offset+g_kept[index].last-g_kept[index].first);
-    if(index+1==g_kept.size())right=g_montageTrack.right;
-    return {left,g_montageTrack.top+2,right,g_montageTrack.bottom-2};
+    if(index>=clips.size())return {left,row.top,row.right,row.bottom};
+    int right=MontageX(offset+clips[index].last-clips[index].first);
+    if(index+1==clips.size())right=MontageX(ClipsDuration(clips));
+    return {left,row.top+2,right,row.bottom-2};
 }
-int MontageClipAtX(int x){
-    if(x<g_montageTrack.left||x>=g_montageTrack.right)return -1;
-    for(size_t i=0;i<g_kept.size();++i){
-        RECT r=MontageClipRect(i);
+RECT MontageClipRect(size_t index){return ClipRect(g_kept,index,g_montageTrack);}
+RECT AudioClipRect(size_t index){return ClipRect(g_audioKept,index,g_audioTrack);}
+int ClipAtX(const std::vector<Span>& clips,int x,RECT row){
+    if(x<row.left||x>=row.right)return -1;
+    for(size_t i=0;i<clips.size();++i){
+        RECT r=ClipRect(clips,i,row);
         if(x>=r.left&&x<r.right)return (int)i;
     }
     return -1;
 }
-int MontageInsertSlot(int x){
-    for(size_t i=0;i<g_kept.size();++i){
-        RECT r=MontageClipRect(i);
+int InsertSlot(const std::vector<Span>& clips,int x,RECT row){
+    for(size_t i=0;i<clips.size();++i){
+        RECT r=ClipRect(clips,i,row);
         if(x<(r.left+r.right)/2)return (int)i;
     }
-    return (int)g_kept.size();
+    return (int)clips.size();
 }
-void MoveClip(int from,int slot){
-    int n=(int)g_kept.size();
+void MoveClip(int from,int slot,bool audio){
+    auto& clips=audio?g_audioKept:g_kept;
+    int n=(int)clips.size();
     if(from<0||from>=n||g_exporting)return;
     slot=std::max(0,std::min(slot,n));
     int destination=slot>from?slot-1:slot;
     if(destination==from){RedrawTrack();return;}
     Remember();
-    Span selected=g_kept[from];
-    g_kept.erase(g_kept.begin()+from);
-    g_kept.insert(g_kept.begin()+destination,selected);
-    g_selected=destination;
-    Status(L"Порядок частей изменён. Экспорт сохранит этот порядок. Ctrl+Z — отмена.");
-    SeekTo(selected.first);
-}
-RECT TrackRect(){
-    RECT r;GetClientRect(g_window,&r);
-    return {20,r.bottom-156,r.right-20,r.bottom-143};
+    Span item=clips[from];
+    clips.erase(clips.begin()+from);
+    clips.insert(clips.begin()+destination,item);
+    if(audio)g_selectedAudio=destination;else g_selected=destination;
+    g_focusAudio=audio;
+    SeekTo(std::min(g_cursor,MontageDuration()));
+    Status(audio?L"Аудиочасти переставлены. Ctrl+Z — отмена.":L"Видеочасти переставлены. Экспорт сохранит этот порядок.");
 }
 RECT MontageTrackRect(){
     RECT r;GetClientRect(g_window,&r);
-    return {20,r.bottom-113,r.right-20,r.bottom-68};
+    return {18,r.bottom-175,r.right-18,r.bottom-145};
 }
-LONGLONG PosFromX(int x){
-    int span=std::max(1,static_cast<int>(g_track.right-g_track.left));
-    double f=(double)(x-g_track.left)/span;
-    return ClampTime((LONGLONG)(std::max(0.0,std::min(1.0,f))*g_duration),g_duration);
+RECT AudioTrackRect(){
+    RECT r;GetClientRect(g_window,&r);
+    return {18,r.bottom-110,r.right-18,r.bottom-80};
 }
-int XFromPos(LONGLONG t){
-    if(g_duration<=0)return g_track.left;
-    double frac=(double)t/(double)g_duration;
-    return g_track.left+(int)(frac*(g_track.right-g_track.left));
-}
-void DrawTimeline(HDC dc){
-    if(g_duration<=0)return;
-    RECT track=g_track;
-    SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(194,203,216));
-    RECT sourceLabel={track.left,track.top-23,track.right,track.top-1};
-    DrawTextW(dc,L"Исходник: щелчок — перемотка, протяжка — выделение участка",-1,
-              &sourceLabel,DT_SINGLELINE|DT_LEFT|DT_VCENTER);
-    HBRUSH bg=CreateSolidBrush(RGB(75,42,47));FillRect(dc,&track,bg);DeleteObject(bg);
-    for(size_t i=0;i<g_kept.size();++i){
-        RECT r={XFromPos(g_kept[i].first),track.top,XFromPos(g_kept[i].last),track.bottom};
+void DrawTrack(HDC dc,const std::vector<Span>& clips,RECT track,bool audio){
+    HBRUSH bg=CreateSolidBrush(audio?RGB(48,62,79):RGB(56,60,72));
+    FillRect(dc,&track,bg);DeleteObject(bg);
+    for(size_t i=0;i<clips.size();++i){
+        RECT r=ClipRect(clips,i,track);
         if(r.right<=r.left)continue;
-        HBRUSH fill=CreateSolidBrush((int)i==g_selected?RGB(62,151,207):RGB(76,111,151));
+        bool active=(audio?g_selectedAudio:g_selected)==(int)i && g_focusAudio==audio;
+        HBRUSH fill=CreateSolidBrush(audio?(active?RGB(71,175,142):RGB(55,123,112)):
+                                           (active?RGB(67,151,206):RGB(74,108,148)));
         FillRect(dc,&r,fill);DeleteObject(fill);
-    }
-    if(g_dragging){
-        int a=XFromPos(g_dragStart),b=XFromPos(g_dragEnd);if(a>b)std::swap(a,b);
-        HBRUSH overlay=CreateHatchBrush(HS_DIAGCROSS,RGB(250,180,70));
-        RECT sel={a,track.top,b,track.bottom};
-        if(sel.right>sel.left){SetBkMode(dc,TRANSPARENT);FillRect(dc,&sel,overlay);}DeleteObject(overlay);
-    }
-    int x=XFromPos(g_cursor);
-    HPEN pen=CreatePen(PS_SOLID,2,RGB(255,229,116));HPEN old=(HPEN)SelectObject(dc,pen);
-    MoveToEx(dc,x,track.top-3,nullptr);LineTo(dc,x,track.bottom+3);
-    SelectObject(dc,old);DeleteObject(pen);
-    RECT montage=g_montageTrack;
-    SetTextColor(dc,RGB(194,203,216));
-    RECT montageLabel={montage.left,montage.top-24,montage.right,montage.top-2};
-    DrawTextW(dc,L"Монтаж: перетащите часть мышью, чтобы поменять порядок экспорта",-1,
-              &montageLabel,DT_SINGLELINE|DT_LEFT|DT_VCENTER);
-    HBRUSH montageBg=CreateSolidBrush(RGB(58,64,75));
-    FillRect(dc,&montage,montageBg);DeleteObject(montageBg);
-    for(size_t i=0;i<g_kept.size();++i){
-        RECT r=MontageClipRect(i);
-        if(r.right<=r.left)continue;
-        HBRUSH fill=CreateSolidBrush((int)i==g_selected?RGB(62,151,207):RGB(76,111,151));
-        FillRect(dc,&r,fill);DeleteObject(fill);
-        HPEN div=CreatePen(PS_SOLID,2,RGB(25,29,36));
-        HPEN previous=(HPEN)SelectObject(dc,div);
-        MoveToEx(dc,r.left,montage.top,nullptr);LineTo(dc,r.left,montage.bottom);
-        SelectObject(dc,previous);DeleteObject(div);
-        if(r.right-r.left>47){
-            SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(255,255,255));
-            std::wstring name=L"Часть "+std::to_wstring(i+1);
-            RECT txt=r;txt.left+=3;txt.right-=3;
-            DrawTextW(dc,name.c_str(),-1,&txt,DT_SINGLELINE|DT_CENTER|DT_VCENTER|DT_END_ELLIPSIS);
+        HPEN sep=CreatePen(PS_SOLID,2,RGB(23,27,33));
+        HPEN old=(HPEN)SelectObject(dc,sep);
+        MoveToEx(dc,r.left,track.top,nullptr);LineTo(dc,r.left,track.bottom);
+        SelectObject(dc,old);DeleteObject(sep);
+        if(r.right-r.left>56){
+            RECT label=r;label.left+=3;label.right-=3;
+            std::wstring name=(audio?L"Аудио ":L"Часть ")+std::to_wstring(i+1);
+            SetTextColor(dc,RGB(249,252,255));SetBkMode(dc,TRANSPARENT);
+            DrawTextW(dc,name.c_str(),-1,&label,DT_SINGLELINE|DT_CENTER|DT_VCENTER|DT_END_ELLIPSIS);
         }
     }
+}
+void DrawTimeline(HDC dc){
+    if(g_file.empty())return;
+    RECT video=g_montageTrack,audio=g_audioTrack;
+    SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(191,206,224));
+    RECT label={video.left,video.top-24,video.right,video.top-3};
+    DrawTextW(dc,L"ВИДЕО — тяните часть для перестановки · Shift+протяжка — выделить",-1,
+              &label,DT_SINGLELINE|DT_LEFT|DT_VCENTER);
+    DrawTrack(dc,g_kept,video,false);
+    label={audio.left,audio.top-24,audio.right,audio.top-3};
+    std::wstring labelAudio=g_audioFile.empty()?L"АУДИО — нажмите «Загрузить аудио»":
+                                           L"АУДИО — тяните для перестановки · Shift+протяжка — выделить";
+    DrawTextW(dc,labelAudio.c_str(),-1,&label,DT_SINGLELINE|DT_LEFT|DT_VCENTER);
+    DrawTrack(dc,g_audioKept,audio,true);
+    if(g_dragging){
+        int a=MontageX(g_dragStart),b=MontageX(g_dragEnd);
+        if(a>b)std::swap(a,b);
+        RECT row=g_focusAudio?audio:video;
+        RECT sel={a,row.top,b,row.bottom};
+        HBRUSH overlay=CreateHatchBrush(HS_DIAGCROSS,RGB(250,180,70));
+        FillRect(dc,&sel,overlay);DeleteObject(overlay);
+    }
+    int cursorX=MontageX(g_cursor);
+    HPEN pen=CreatePen(PS_SOLID,2,RGB(255,233,105));
+    HPEN old=(HPEN)SelectObject(dc,pen);
+    MoveToEx(dc,cursorX,video.top-5,nullptr);LineTo(dc,cursorX,audio.bottom+4);
+    SelectObject(dc,old);DeleteObject(pen);
     if(g_clipDragging){
-        int slot=std::max(0,std::min(g_insertSlot,(int)g_kept.size()));
-        int pos=slot==(int)g_kept.size()?montage.right:MontageClipRect(slot).left;
-        HPEN highlight=CreatePen(PS_SOLID,3,RGB(255,229,116));
-        HPEN previous=(HPEN)SelectObject(dc,highlight);
-        MoveToEx(dc,pos,montage.top-3,nullptr);LineTo(dc,pos,montage.bottom+3);
-        SelectObject(dc,previous);DeleteObject(highlight);
+        const auto& clips=g_dragAudio?g_audioKept:g_kept;
+        RECT row=g_dragAudio?audio:video;
+        int slot=std::max(0,std::min(g_insertSlot,(int)clips.size()));
+        int x=slot==(int)clips.size()?MontageX(ClipsDuration(clips)):ClipRect(clips,slot,row).left;
+        HPEN target=CreatePen(PS_SOLID,3,RGB(255,233,105));
+        old=(HPEN)SelectObject(dc,target);
+        MoveToEx(dc,x,row.top-5,nullptr);LineTo(dc,x,row.bottom+5);
+        SelectObject(dc,old);DeleteObject(target);
     }
 }
 void Relayout(){
     if(!g_window)return;
-    RECT client;GetClientRect(g_window,&client);
-    int w=client.right,h=client.bottom;
-    if(g_video)MoveWindow(g_video,20,53,w-40,std::max(110,h-331),TRUE);
-    int row1=h-252;
-    int sizes[]={107,120,116,116,134,127,95};
-    int x=20;
-    for(int i=0;i<7;++i){if(g_buttons[i])MoveWindow(g_buttons[i],x,row1,sizes[i],32,TRUE);x+=sizes[i]+8;}
-    if(g_time)MoveWindow(g_time,20,h-207,w-40,30,TRUE);
-    g_track=TrackRect();
+    RECT r;GetClientRect(g_window,&r);
+    int w=r.right,h=r.bottom;
+    if(g_video)MoveWindow(g_video,18,54,w-36,std::max(120,h-362),TRUE);
+    int row=h-297,x=18;
+    auto place=[&](HWND hwnd,int width){
+        if(hwnd)MoveWindow(hwnd,x,row,width,37,TRUE);
+        x+=width+9;
+    };
+    place(g_buttons[0],132);
+    place(g_loadAudio,179);
+    place(g_buttons[1],121);
+    place(g_buttons[2],129);
+    place(g_buttons[3],110);
+    place(g_buttons[6],116);
+    row=h-247;x=18;
+    place(g_buttons[4],173);
+    place(g_buttons[5],163);
+    if(g_time)MoveWindow(g_time,393,h-239,195,29,TRUE);
+    if(g_noAudio)MoveWindow(g_noAudio,w-319,h-246,300,37,TRUE);
     g_montageTrack=MontageTrackRect();
-    if(g_buttons[7])MoveWindow(g_buttons[7],w-302,h-51,138,34,TRUE);
-    if(g_buttons[8])MoveWindow(g_buttons[8],w-154,h-51,134,34,TRUE);
-    if(g_noAudio)MoveWindow(g_noAudio,20,h-51,194,34,TRUE);
-    if(g_status)MoveWindow(g_status,222,h-46,std::max(60,w-555),30,TRUE);
-    RedrawTrack();
+    g_audioTrack=AudioTrackRect();
+    if(g_buttons[7])MoveWindow(g_buttons[7],w-311,h-57,138,36,TRUE);
+    if(g_buttons[8])MoveWindow(g_buttons[8],w-164,h-57,145,36,TRUE);
+    if(g_status)MoveWindow(g_status,18,h-53,std::max(100,w-345),31,TRUE);
+    InvalidateRect(g_window,nullptr,FALSE);
 }
 HWND MakeButton(int idx,int id,const wchar_t* caption){
-    HWND h=CreateWindowExW(0,L"BUTTON",caption,WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
-        0,0,90,30,g_window,(HMENU)(INT_PTR)id,GetModuleHandleW(nullptr),nullptr);
+    HWND h=CreateWindowExW(0,L"BUTTON",caption,WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON,
+        0,0,100,36,g_window,(HMENU)(INT_PTR)id,GetModuleHandleW(nullptr),nullptr);
     SendMessageW(h,WM_SETFONT,(WPARAM)g_font,TRUE);
     g_buttons[idx]=h;return h;
+}
+std::wstring AudioFileDialog(){
+    wchar_t path[MAX_PATH]={};
+    OPENFILENAMEW d={};d.lStructSize=sizeof(d);d.hwndOwner=g_window;
+    d.lpstrFile=path;d.nMaxFile=MAX_PATH;
+    d.lpstrFilter=L"Аудио (MP3, WAV, M4A, AAC, WMA)\0*.mp3;*.wav;*.m4a;*.aac;*.wma\0Все файлы (*.*)\0*.*\0";
+    d.nFilterIndex=1;d.Flags=OFN_PATHMUSTEXIST|OFN_FILEMUSTEXIST;
+    return GetOpenFileNameW(&d)?std::wstring(path):std::wstring();
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
@@ -580,7 +709,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_CREATE:{
         g_window=hwnd;
         DragAcceptFiles(hwnd,TRUE);
-        g_font=CreateFontW(-17,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
+        g_font=CreateFontW(-16,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
         g_video=CreateWindowExW(WS_EX_CLIENTEDGE,L"STATIC",L"Откройте видео",
             WS_CHILD|WS_VISIBLE|SS_BLACKRECT,0,0,100,100,hwnd,nullptr,GetModuleHandleW(nullptr),nullptr);
@@ -589,18 +718,21 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         MakeButton(4,ID_TRIM_START,L"Убрать до курсора");
         MakeButton(5,ID_TRIM_END,L"Убрать после");MakeButton(6,ID_UNDO,L"↶ Отмена");
         MakeButton(7,ID_FAST,L"⚡ Быстро");MakeButton(8,ID_EXACT,L"◎ Точно");
-        g_noAudio=CreateWindowW(L"BUTTON",L"Экспорт без звука",
-            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,0,0,194,32,
+        g_loadAudio=CreateWindowW(L"BUTTON",L"Загрузить аудио",
+            WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON|WS_TABSTOP,0,0,179,37,
+            hwnd,(HMENU)(INT_PTR)ID_LOAD_AUDIO,GetModuleHandleW(nullptr),nullptr);
+        SendMessageW(g_loadAudio,WM_SETFONT,(WPARAM)g_font,TRUE);
+        g_noAudio=CreateWindowW(L"BUTTON",L"Отключить оригинальный звук",
+            WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,0,0,300,37,
             hwnd,(HMENU)(INT_PTR)ID_NO_AUDIO,GetModuleHandleW(nullptr),nullptr);
-        SendMessageW(g_noAudio,WM_SETFONT,(WPARAM)g_font,TRUE);
         g_time=CreateWindowW(L"STATIC",L"00:00:00 / 00:00:00",WS_CHILD|WS_VISIBLE,0,0,100,20,hwnd,nullptr,nullptr,nullptr);
-        g_status=CreateWindowW(L"STATIC",L"Откройте MP4. Можно перетащить файл в окно.",WS_CHILD|WS_VISIBLE|SS_LEFT,0,0,100,20,hwnd,nullptr,nullptr,nullptr);
+        g_status=CreateWindowW(L"STATIC",L"Откройте MP4. Можно перетащить файл в окно.",WS_CHILD|WS_VISIBLE|SS_LEFT|SS_ENDELLIPSIS,0,0,100,20,hwnd,nullptr,nullptr,nullptr);
         SendMessageW(g_time,WM_SETFONT,(WPARAM)g_font,TRUE);
         SendMessageW(g_status,WM_SETFONT,(WPARAM)g_font,TRUE);
         Relayout();SetTimer(hwnd,1,110,nullptr);return 0;
     }
     case WM_GETMINMAXINFO:{
-        auto p=(MINMAXINFO*)lp;p->ptMinTrackSize.x=930;p->ptMinTrackSize.y=570;return 0;
+        auto p=(MINMAXINFO*)lp;p->ptMinTrackSize.x=960;p->ptMinTrackSize.y=635;return 0;
     }
     case WM_SIZE:Relayout();return 0;
     case WM_DROPFILES:{
@@ -610,51 +742,56 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_LBUTTONDOWN:{
         POINT p={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
-        if(g_file.empty()||g_exporting)break;
-        if(PtInRect(&g_montageTrack,p)){
-            int index=MontageClipAtX(p.x);
-            if(index>=0){
-                g_dragging=false; // Selecting a clip cancels source-range selection.
-                g_clipMouseDown=true;g_clipDragging=false;
-                g_dragClipIndex=index;g_insertSlot=index;g_mousePt=p;g_selected=index;
-                SetCapture(hwnd);RedrawTrack();return 0;
-            }
-        }
-        if(!PtInRect(&g_track,p))break;
-        g_mouseDown=true;g_dragging=false;g_dragStart=g_dragEnd=PosFromX(p.x);g_mousePt=p;
-        g_cursor=g_dragStart;g_selected=SpanAt(g_cursor);SetCapture(hwnd);RedrawTrack();return 0;
+        if(g_file.empty()||g_exporting)return 0;
+        bool audio=PtInRect(&g_audioTrack,p)!=0;
+        bool video=PtInRect(&g_montageTrack,p)!=0;
+        if(!audio&&!video)break;
+        const auto& clips=audio?g_audioKept:g_kept;
+        RECT row=audio?g_audioTrack:g_montageTrack;
+        int index=ClipAtX(clips,p.x,row);
+        if(index<0)break;
+        g_focusAudio=audio;g_dragAudio=audio;
+        if(audio)g_selectedAudio=index;else g_selected=index;
+        g_dragging=false;g_clipDragging=false;
+        g_clipMouseDown=true;g_dragClipIndex=index;g_insertSlot=index;
+        g_mousePt=p;g_rangeSelect=(GetKeyState(VK_SHIFT)&0x8000)!=0;
+        g_dragStart=g_dragEnd=PositionFromX(p.x);
+        SeekTo(g_dragStart);SetCapture(hwnd);RedrawTrack();return 0;
     }
     case WM_MOUSEMOVE:{
+        if(!g_clipMouseDown)break;
         int x=GET_X_LPARAM(lp);
-        if(g_clipMouseDown){
+        if(g_rangeSelect){
+            if(abs(x-g_mousePt.x)>5)g_dragging=true;
+            g_dragEnd=PositionFromX(x);
+            SeekTo(g_dragEnd);
+        }else{
             if(abs(x-g_mousePt.x)>5)g_clipDragging=true;
-            if(g_clipDragging)g_insertSlot=MontageInsertSlot(x);
-            RedrawTrack();return 0;
+            if(g_clipDragging){
+                const auto& clips=g_dragAudio?g_audioKept:g_kept;
+                RECT row=g_dragAudio?g_audioTrack:g_montageTrack;
+                g_insertSlot=InsertSlot(clips,x,row);
+            }
         }
-        if(!g_mouseDown)break;
-        if(abs(x-g_mousePt.x)>5)g_dragging=true;
-        g_dragEnd=PosFromX(x);g_cursor=g_dragEnd;RedrawTrack();return 0;
+        RedrawTrack();return 0;
     }
     case WM_LBUTTONUP:{
-        if(g_clipMouseDown){
-            int source=g_dragClipIndex,slot=g_insertSlot;
-            bool moved=g_clipDragging;
-            g_clipMouseDown=false;g_clipDragging=false;g_dragClipIndex=-1;
-            ReleaseCapture();
-            if(moved)MoveClip(source,slot);
-            else if(source>=0&&source<(int)g_kept.size())SeekTo(g_kept[source].first);
-            RedrawTrack();return 0;
-        }
-        if(!g_mouseDown)break;
-        g_mouseDown=false;ReleaseCapture();
-        if(!g_dragging){SeekTo(g_dragStart);}
-        else {g_cursor=g_dragEnd;Status(L"Диапазон выделен. Нажмите «Удалить», чтобы вырезать его.");RedrawTrack();}
-        return 0;
+        if(!g_clipMouseDown)break;
+        bool moved=g_clipDragging,range=g_rangeSelect&&g_dragging;
+        int from=g_dragClipIndex,slot=g_insertSlot;bool audio=g_dragAudio;
+        g_clipMouseDown=false;g_clipDragging=false;g_dragClipIndex=-1;
+        ReleaseCapture();
+        if(moved)MoveClip(from,slot,audio);
+        else if(range)Status(L"Диапазон выделен. Нажмите «Удалить», чтобы его вырезать.");
+        else SeekTo(g_dragStart);
+        RedrawTrack();return 0;
     }
     case WM_KEYDOWN:{
         if(wp=='Z'&&(GetKeyState(VK_CONTROL)&0x8000)){Undo();return 0;}
-        if((wp==VK_LEFT||wp==VK_RIGHT)&&(GetKeyState(VK_CONTROL)&0x8000) && g_selected>=0){
-            MoveClip(g_selected,wp==VK_LEFT?g_selected-1:g_selected+2);return 0;
+        if((wp==VK_LEFT||wp==VK_RIGHT)&&(GetKeyState(VK_CONTROL)&0x8000)){
+            int selected=g_focusAudio?g_selectedAudio:g_selected;
+            if(selected>=0)MoveClip(selected,wp==VK_LEFT?selected-1:selected+2,g_focusAudio);
+            return 0;
         }
         if(wp==VK_DELETE){RemoveSelected();return 0;}
         if(wp==VK_SPACE){SendMessageW(hwnd,WM_COMMAND,ID_PLAY,0);return 0;}
@@ -663,15 +800,34 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_COMMAND:{
         switch(LOWORD(wp)){
         case ID_OPEN:{auto p=FileDialog(false);if(!p.empty())OpenFile(p);break;}
+        case ID_LOAD_AUDIO:{auto p=AudioFileDialog();if(!p.empty())OpenAudioFile(p);break;}
+        case ID_NO_AUDIO:
+            if(HIWORD(wp)!=BN_CLICKED)break;
+            g_muteOriginal=!g_muteOriginal;
+            if(g_player)g_player->SetVolume(g_muteOriginal?0.0f:1.0f);
+            InvalidateRect(g_noAudio,nullptr,TRUE);
+            Status(g_muteOriginal?L"Оригинальный звук отключён. Загруженное аудио останется.":L"Оригинальный звук включён.");
+            break;
         case ID_PLAY:
             if(g_player){
-                if(g_playing){if(SUCCEEDED(g_player->Pause()))g_playing=false;}
-                else {if(SUCCEEDED(g_player->Play()))g_playing=true;}
+                if(g_playing){
+                    g_player->Pause();
+                    if(g_audioPlayer)g_audioPlayer->Pause();
+                    g_playing=false;
+                }else{
+                    if(g_cursor>=MontageDuration())SeekTo(0);
+                    if(SUCCEEDED(g_player->Play())){
+                        g_playing=true;
+                        ClipPosition a=LocateClip(g_audioKept,g_cursor);
+                        if(g_audioPlayer&&a.index>=0)g_audioPlayer->Play();
+                    }
+                }
             }break;
         case ID_SPLIT:SplitHere();break;
         case ID_REMOVE:RemoveSelected();break;
         case ID_TRIM_START:if(!g_file.empty()&&!g_exporting)RemoveInterval(0,g_cursor);break;
-        case ID_TRIM_END:if(!g_file.empty()&&!g_exporting)RemoveInterval(g_cursor,g_duration);break;
+        case ID_TRIM_END:if(!g_file.empty()&&!g_exporting)RemoveInterval(g_cursor,
+            g_focusAudio?ClipsDuration(g_audioKept):MontageDuration());break;
         case ID_UNDO:Undo();break;
         case ID_FAST:StartExport(false);break;
         case ID_EXACT:StartExport(true);break;
@@ -679,28 +835,40 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         return 0;
     }
     case WM_TIMER:{
-        if(!g_player||!g_playing||g_file.empty())break;
+        if(!g_player||!g_playing||g_previewClip<0)break;
         PROPVARIANT pos;PropVariantInit(&pos);
         if(SUCCEEDED(g_player->GetPosition(MFP_POSITIONTYPE_100NS,&pos))&&pos.vt==VT_I8){
-            LONGLONG t=pos.hVal.QuadPart;
-            if(t<g_duration){
-                int idx=SpanAt(t);
-                if(idx<0){
-                    auto it=std::min_element(g_kept.begin(),g_kept.end(),[t](Span a,Span b){
-                        const LONGLONG nextA=a.first>t?a.first:LLONG_MAX;
-                        const LONGLONG nextB=b.first>t?b.first:LLONG_MAX;
-                        return nextA<nextB;
-                    });
-                    if(it!=g_kept.end()&&it->first>t)SeekTo(it->first);
-                    else {g_player->Pause();g_playing=false;}
-                }else{
-                    g_cursor=t;
-                    SetWindowTextW(g_time,(TimeLabel(t)+L" / "+TimeLabel(g_duration)).c_str());RedrawTrack();
+            LONGLONG source=pos.hVal.QuadPart;
+            if(g_previewClip<(int)g_kept.size()){
+                Span clip=g_kept[g_previewClip];
+                LONGLONG startOffset=0;
+                for(int i=0;i<g_previewClip;++i)
+                    startOffset+=g_kept[i].last-g_kept[i].first;
+                if(source>=clip.last-HNS/100){
+                    LONGLONG next=startOffset+(clip.last-clip.first);
+                    if(next>=MontageDuration()){
+                        g_player->Pause();
+                        if(g_audioPlayer)g_audioPlayer->Pause();
+                        g_playing=false;g_cursor=MontageDuration();
+                    }else SeekTo(next);
+                }else if(source>=clip.first){
+                    g_cursor=startOffset+source-clip.first;
+                    ClipPosition audio=LocateClip(g_audioKept,g_cursor);
+                    if(audio.index!=g_previewAudioClip){
+                        g_previewAudioClip=audio.index;
+                        if(g_audioPlayer){
+                            if(audio.index>=0){
+                                SetPlayerPosition(g_audioPlayer,audio.source);
+                                g_audioPlayer->Play();
+                            }else g_audioPlayer->Pause();
+                        }
+                    }
                 }
             }
+            SetWindowTextW(g_time,(TimeLabel(g_cursor)+L" / "+TimeLabel(MontageDuration())).c_str());
+            RedrawTrack();
         }
-        PropVariantClear(&pos);
-        return 0;
+        PropVariantClear(&pos);return 0;
     }
     case WM_EXPORT_PROGRESS:
         if(wp==1001){Status(L"Предпросмотр: Media Foundation сообщила об ошибке.");}
@@ -714,6 +882,30 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         else ShowFail(L"Не удалось сохранить MP4",r->message);
         return 0;
     }
+    case WM_DRAWITEM:{
+        DRAWITEMSTRUCT* d=(DRAWITEMSTRUCT*)lp;
+        if(d && d->CtlID==ID_NO_AUDIO){
+            RECT r=d->rcItem;
+            HBRUSH bg=CreateSolidBrush(g_muteOriginal?RGB(32,87,70):RGB(43,54,69));
+            FillRect(d->hDC,&r,bg);DeleteObject(bg);
+            HPEN border=CreatePen(PS_SOLID,2,g_muteOriginal?RGB(97,224,156):RGB(94,115,143));
+            HGDIOBJ oldPen=SelectObject(d->hDC,border);
+            HGDIOBJ oldBrush=SelectObject(d->hDC,GetStockObject(NULL_BRUSH));
+            Rectangle(d->hDC,r.left,r.top,r.right-1,r.bottom-1);
+            SelectObject(d->hDC,oldBrush);SelectObject(d->hDC,oldPen);DeleteObject(border);
+            RECT check={r.left+10,r.top+10,r.left+27,r.top+27};
+            DrawFrameControl(d->hDC,&check,DFC_BUTTON,DFCS_BUTTONCHECK|
+                             (g_muteOriginal?DFCS_CHECKED:0));
+            SetBkMode(d->hDC,TRANSPARENT);SetTextColor(d->hDC,RGB(243,248,253));
+            HFONT previous=(HFONT)SelectObject(d->hDC,g_font);
+            RECT txt={r.left+34,r.top,r.right-6,r.bottom};
+            DrawTextW(d->hDC,L"Отключить оригинальный звук",-1,&txt,
+                      DT_SINGLELINE|DT_VCENTER|DT_LEFT);
+            SelectObject(d->hDC,previous);
+            return TRUE;
+        }
+        break;
+    }
     case WM_PAINT:{
         PAINTSTRUCT ps;HDC dc=BeginPaint(hwnd,&ps);
         RECT client;GetClientRect(hwnd,&client);
@@ -721,7 +913,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(219,227,238));
         HFONT previous=(HFONT)SelectObject(dc,g_font);
         RECT title={20,16,client.right-20,45};
-        DrawTextW(dc,L"MiniCut   ·   видео без FFmpeg",-1,&title,DT_SINGLELINE|DT_VCENTER);
+        DrawTextW(dc,L"MiniCut",-1,&title,DT_SINGLELINE|DT_VCENTER);
         if(g_duration){DrawTimeline(dc);}
         SelectObject(dc,previous);EndPaint(hwnd,&ps);return 0;
     }
