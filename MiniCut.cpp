@@ -44,7 +44,7 @@ constexpr LONGLONG HNS = 10000000LL;
 constexpr UINT WM_EXPORT_DONE = WM_APP + 10;
 constexpr UINT WM_EXPORT_PROGRESS = WM_APP + 11;
 constexpr int ID_OPEN=100, ID_PLAY=101, ID_SPLIT=102, ID_REMOVE=103,
-    ID_TRIM_START=104, ID_TRIM_END=105, ID_UNDO=106, ID_FAST=107, ID_EXACT=108,
+    ID_TRIM_START=104, ID_TRIM_END=105, ID_UNDO=106, ID_SAVE=107,
     ID_NO_AUDIO=109, ID_LOAD_AUDIO=110;
 
 template <typename T> struct ComPtr {
@@ -79,7 +79,7 @@ std::wstring TimeLabel(LONGLONG t) {
 }
 
 HWND g_window=nullptr,g_video=nullptr,g_status=nullptr,g_time=nullptr,g_noAudio=nullptr,g_loadAudio=nullptr;
-HWND g_buttons[9]={};
+HWND g_buttons[8]={};
 UINT32 g_previewWidth=0,g_previewHeight=0;
 int g_spinnerStep=0,g_exportPercent=-1;
 void Relayout();
@@ -316,10 +316,13 @@ void RemoveSelected(){
         Remember();parts.erase(parts.begin()+selected);
         NormalizeSelection();SeekTo(std::min(g_cursor,MontageDuration()));
         Status(g_focusAudio?L"Аудиофрагмент удалён. Ctrl+Z — отмена.":L"Видеофрагмент удалён. Ctrl+Z — отмена.");
+    }else{
+        Status(L"Сначала выделите фрагмент на видео- или аудиодорожке.");
     }
 }
 void Undo(){
-    if(g_history.empty()||g_exporting)return;
+    if(g_exporting)return;
+    if(g_history.empty()){Status(L"Нет действий для отмены.");return;}
     EditState x=std::move(g_history.back());g_history.pop_back();
     g_kept=std::move(x.video);g_audioKept=std::move(x.audio);
     g_selected=x.videoSelected;g_selectedAudio=x.audioSelected;g_focusAudio=x.focusAudio;
@@ -536,11 +539,7 @@ void ExportVideo(HWND notify,std::wstring input,std::wstring output,std::vector<
         if(mixAudio)WriteMixedAudioUntil(writer.get(),audioStream,mixedPCM,audioWritten,total);
         Check(writer->Finalize(),L"Завершение MP4");
         result->ok=true;
-        result->message=mixAudio?
-            L"Готово. Видео и монтажная аудиодорожка сохранены в MP4 (AAC).":
-            (muteAudio?L"Готово. Оригинальный звук отключён.":
-            (exact?L"Точный экспорт завершён. Видео H.264, звук AAC сохранён.":
-                   L"Быстрый экспорт завершён. Потоки сохранены без перекодирования."));
+        result->message=L"Сохранение выполнено успешно.";
     }catch(const MediaError& e){result->message=ErrorText(e);}
     catch(...){result->message=L"Неизвестная ошибка экспорта";}
     if(!result->ok)DeleteFileW(output.c_str());
@@ -572,7 +571,7 @@ void StartExport(bool exact){
     bool muteAudio=g_muteOriginal;
     SetUIBusy(true);
     g_spinnerStep=0;g_exportPercent=0;
-    Status(exact?L"Точный экспорт: кодирование кадр за кадром…":L"Быстрый экспорт: поиск ключевых кадров…");
+    Status(L"Сохранение видео…");
     std::thread([win=g_window,src=g_file,dst=output,parts=g_kept,len=g_duration,exact,muteAudio,
                  audio=g_audioFile,audioParts=g_audioKept](){
         ExportVideo(win,src,dst,parts,len,exact,muteAudio,audio,audioParts);
@@ -732,9 +731,8 @@ void Relayout(){
     if(g_noAudio)MoveWindow(g_noAudio,w-319,h-246,300,37,TRUE);
     g_montageTrack=MontageTrackRect();
     g_audioTrack=AudioTrackRect();
-    if(g_buttons[7])MoveWindow(g_buttons[7],w-311,h-57,138,36,TRUE);
-    if(g_buttons[8])MoveWindow(g_buttons[8],w-164,h-57,145,36,TRUE);
-    if(g_status)MoveWindow(g_status,18,h-53,std::max(100,w-345),31,TRUE);
+    if(g_buttons[7])MoveWindow(g_buttons[7],w-174,h-57,155,36,TRUE);
+    if(g_status)MoveWindow(g_status,18,h-53,std::max(100,w-212),31,TRUE);
     InvalidateRect(g_window,nullptr,FALSE);
 }
 HWND MakeButton(int idx,int id,const wchar_t* caption){
@@ -762,7 +760,7 @@ void DrawExportSpinner(HDC dc){
     RECT area=SpinnerRect();
     SetBkMode(dc,TRANSPARENT);
     SetTextColor(dc,RGB(232,239,247));
-    std::wstring caption=L"Экспорт: "+(g_exportPercent>=0
+    std::wstring caption=L"Сохранение: "+(g_exportPercent>=0
         ?std::to_wstring(g_exportPercent)+L"%":std::wstring(L"подготовка"));
     RECT label={area.left,area.top,area.right-49,area.bottom};
     DrawTextW(dc,caption.c_str(),-1,&label,DT_SINGLELINE|DT_RIGHT|DT_VCENTER);
@@ -793,7 +791,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         MakeButton(2,ID_SPLIT,L"✂ Разрезать");MakeButton(3,ID_REMOVE,L"Удалить");
         MakeButton(4,ID_TRIM_START,L"Убрать до курсора");
         MakeButton(5,ID_TRIM_END,L"Убрать после");MakeButton(6,ID_UNDO,L"↶ Отмена");
-        MakeButton(7,ID_FAST,L"⚡ Быстро");MakeButton(8,ID_EXACT,L"◎ Точно");
+        MakeButton(7,ID_SAVE,L"Сохранить");
         g_loadAudio=CreateWindowW(L"BUTTON",L"Загрузить аудио",
             WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON|WS_TABSTOP,0,0,179,37,
             hwnd,(HMENU)(INT_PTR)ID_LOAD_AUDIO,GetModuleHandleW(nullptr),nullptr);
@@ -826,6 +824,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         RECT row=audio?g_audioTrack:g_montageTrack;
         int index=ClipAtX(clips,p.x,row);
         if(index<0)break;
+        SetFocus(hwnd); // Follow selection: Delete and Ctrl+Z target this editor.
         g_focusAudio=audio;g_dragAudio=audio;
         if(audio)g_selectedAudio=index;else g_selected=index;
         g_dragging=false;g_clipDragging=false;
@@ -905,8 +904,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         case ID_TRIM_END:if(!g_file.empty()&&!g_exporting)RemoveInterval(g_cursor,
             g_focusAudio?ClipsDuration(g_audioKept):MontageDuration());break;
         case ID_UNDO:Undo();break;
-        case ID_FAST:StartExport(false);break;
-        case ID_EXACT:StartExport(true);break;
+        case ID_SAVE:StartExport(false);break;
         }
         return 0;
     }
@@ -955,7 +953,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         if(wp==1001){Status(L"Предпросмотр: Media Foundation сообщила об ошибке.");}
         else if(g_exporting){
             g_exportPercent=(int)wp;
-            Status(L"Экспорт: "+std::to_wstring(wp)+L"% …");
+            Status(L"Сохранение: "+std::to_wstring(wp)+L"% …");
             RECT spinner=SpinnerRect();InvalidateRect(hwnd,&spinner,FALSE);
         }
         return 0;
@@ -1036,20 +1034,21 @@ int APIENTRY wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int show){
         nullptr,nullptr,instance,nullptr);
     if(!g_window){MFShutdown();CoUninitialize();return 3;}
     ShowWindow(g_window,show);UpdateWindow(g_window);
-    // Accelerators are routed even if a child button has the keyboard focus.
-    // Do not register global hotkeys: Delete/Ctrl+Z should work ONLY in MiniCut.
-    ACCEL shortcuts[2]={};
-    shortcuts[0].fVirt=FVIRTKEY|FCONTROL;
-    shortcuts[0].key='Z';shortcuts[0].cmd=ID_UNDO;
-    shortcuts[1].fVirt=FVIRTKEY;
-    shortcuts[1].key=VK_DELETE;shortcuts[1].cmd=ID_REMOVE;
-    HACCEL accelerators=CreateAcceleratorTableW(shortcuts,2);
+    // Dispatch shortcuts before focused child BUTTON controls consume key messages.
     MSG msg;
     while(GetMessageW(&msg,nullptr,0,0)>0){
-        if(!accelerators||!TranslateAcceleratorW(g_window,accelerators,&msg)){
-            TranslateMessage(&msg);DispatchMessageW(&msg);
+        if(msg.message==WM_KEYDOWN && !g_exporting){
+            if(msg.wParam==VK_DELETE){
+                SendMessageW(g_window,WM_COMMAND,MAKEWPARAM(ID_REMOVE,0),0);
+                continue;
+            }
+            if(msg.wParam=='Z' && (GetKeyState(VK_CONTROL)&0x8000) &&
+               !(GetKeyState(VK_MENU)&0x8000)){
+                SendMessageW(g_window,WM_COMMAND,MAKEWPARAM(ID_UNDO,0),0);
+                continue;
+            }
         }
+        TranslateMessage(&msg);DispatchMessageW(&msg);
     }
-    if(accelerators)DestroyAcceleratorTable(accelerators);
     MFShutdown();CoUninitialize();return (int)msg.wParam;
 }
