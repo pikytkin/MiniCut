@@ -419,7 +419,7 @@ RECT TrackRect(){
     return {20,r.bottom-124,r.right-20,r.bottom-66};
 }
 LONGLONG PosFromX(int x){
-    int span=std::max(1,g_track.right-g_track.left);
+    int span=std::max(1,static_cast<int>(g_track.right-g_track.left));
     double f=(double)(x-g_track.left)/span;
     return ClampTime((LONGLONG)(std::max(0.0,std::min(1.0,f))*g_duration),g_duration);
 }
