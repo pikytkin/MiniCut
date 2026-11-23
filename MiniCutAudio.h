@@ -95,11 +95,16 @@ void MixSourcePCM(const std::wstring& sourcePath,const std::vector<Span>& spans,
         }
     }
 }
-void WriteMixedAudio(IMFSinkWriter* writer,DWORD stream,const std::vector<int32_t>& mix){
+// Keep AAC near the video time as the sink writer can block on unbalanced streams.
+void WriteMixedAudioUntil(IMFSinkWriter* writer,DWORD stream,
+                          const std::vector<int32_t>& mix,LONGLONG& nextFrame,
+                          LONGLONG targetTime){
     const LONGLONG frameCount=(LONGLONG)mix.size()/MIX_CHANNELS;
+    const LONGLONG desired=std::min(frameCount,AudioFrames(targetTime));
     constexpr LONGLONG FRAMES_PER_SAMPLE=2048;
-    for(LONGLONG start=0;start<frameCount;start+=FRAMES_PER_SAMPLE){
-        const LONGLONG count=std::min(FRAMES_PER_SAMPLE,frameCount-start);
+    while(nextFrame<desired){
+        LONGLONG start=nextFrame;
+        const LONGLONG count=std::min(FRAMES_PER_SAMPLE,desired-start);
         const DWORD byteCount=(DWORD)(count*MIX_BLOCK);
         ComPtr<IMFMediaBuffer> buffer;
         Check(MFCreateMemoryBuffer(byteCount,buffer.put()),L"Создание PCM буфера");
@@ -118,5 +123,6 @@ void WriteMixedAudio(IMFSinkWriter* writer,DWORD stream,const std::vector<int32_
         Check(sample->SetSampleTime(AudioTime(start)),L"Время аудио");
         Check(sample->SetSampleDuration(AudioTime(start+count)-AudioTime(start)),L"Длительность аудио");
         Check(writer->WriteSample(stream,sample.get()),L"Кодирование AAC");
+        nextFrame+=count;
     }
 }
