@@ -659,27 +659,45 @@ void DrawTimeline(HDC dc){
 }
 void Relayout(){
     if(!g_window)return;
-    RECT client;GetClientRect(g_window,&client);
-    int w=client.right,h=client.bottom;
-    if(g_video)MoveWindow(g_video,20,53,w-40,std::max(110,h-331),TRUE);
-    int row1=h-252;
-    int sizes[]={107,120,116,116,134,127,95};
-    int x=20;
-    for(int i=0;i<7;++i){if(g_buttons[i])MoveWindow(g_buttons[i],x,row1,sizes[i],32,TRUE);x+=sizes[i]+8;}
-    if(g_time)MoveWindow(g_time,20,h-207,w-40,30,TRUE);
-    g_track=TrackRect();
+    RECT r;GetClientRect(g_window,&r);
+    int w=r.right,h=r.bottom;
+    if(g_video)MoveWindow(g_video,18,54,w-36,std::max(120,h-362),TRUE);
+    int row=h-297,x=18;
+    auto place=[&](HWND hwnd,int width){
+        if(hwnd)MoveWindow(hwnd,x,row,width,37,TRUE);
+        x+=width+9;
+    };
+    place(g_buttons[0],132);
+    place(g_loadAudio,179);
+    place(g_buttons[1],121);
+    place(g_buttons[2],129);
+    place(g_buttons[3],110);
+    place(g_buttons[6],116);
+    row=h-247;x=18;
+    place(g_buttons[4],173);
+    place(g_buttons[5],163);
+    if(g_time)MoveWindow(g_time,393,h-239,195,29,TRUE);
+    if(g_noAudio)MoveWindow(g_noAudio,w-319,h-246,300,37,TRUE);
     g_montageTrack=MontageTrackRect();
-    if(g_buttons[7])MoveWindow(g_buttons[7],w-302,h-51,138,34,TRUE);
-    if(g_buttons[8])MoveWindow(g_buttons[8],w-154,h-51,134,34,TRUE);
-    if(g_noAudio)MoveWindow(g_noAudio,20,h-51,194,34,TRUE);
-    if(g_status)MoveWindow(g_status,222,h-46,std::max(60,w-555),30,TRUE);
-    RedrawTrack();
+    g_audioTrack=AudioTrackRect();
+    if(g_buttons[7])MoveWindow(g_buttons[7],w-311,h-57,138,36,TRUE);
+    if(g_buttons[8])MoveWindow(g_buttons[8],w-164,h-57,145,36,TRUE);
+    if(g_status)MoveWindow(g_status,18,h-53,std::max(100,w-345),31,TRUE);
+    InvalidateRect(g_window,nullptr,FALSE);
 }
 HWND MakeButton(int idx,int id,const wchar_t* caption){
-    HWND h=CreateWindowExW(0,L"BUTTON",caption,WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
-        0,0,90,30,g_window,(HMENU)(INT_PTR)id,GetModuleHandleW(nullptr),nullptr);
+    HWND h=CreateWindowExW(0,L"BUTTON",caption,WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_PUSHBUTTON,
+        0,0,100,36,g_window,(HMENU)(INT_PTR)id,GetModuleHandleW(nullptr),nullptr);
     SendMessageW(h,WM_SETFONT,(WPARAM)g_font,TRUE);
     g_buttons[idx]=h;return h;
+}
+std::wstring AudioFileDialog(){
+    wchar_t path[MAX_PATH]={};
+    OPENFILENAMEW d={};d.lStructSize=sizeof(d);d.hwndOwner=g_window;
+    d.lpstrFile=path;d.nMaxFile=MAX_PATH;
+    d.lpstrFilter=L"Аудио (MP3, WAV, M4A, AAC, WMA)\0*.mp3;*.wav;*.m4a;*.aac;*.wma\0Все файлы (*.*)\0*.*\0";
+    d.nFilterIndex=1;d.Flags=OFN_PATHMUSTEXIST|OFN_FILEMUSTEXIST;
+    return GetOpenFileNameW(&d)?std::wstring(path):std::wstring();
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
@@ -687,7 +705,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_CREATE:{
         g_window=hwnd;
         DragAcceptFiles(hwnd,TRUE);
-        g_font=CreateFontW(-17,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
+        g_font=CreateFontW(-16,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
         g_video=CreateWindowExW(WS_EX_CLIENTEDGE,L"STATIC",L"Откройте видео",
             WS_CHILD|WS_VISIBLE|SS_BLACKRECT,0,0,100,100,hwnd,nullptr,GetModuleHandleW(nullptr),nullptr);
@@ -696,18 +714,21 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         MakeButton(4,ID_TRIM_START,L"Убрать до курсора");
         MakeButton(5,ID_TRIM_END,L"Убрать после");MakeButton(6,ID_UNDO,L"↶ Отмена");
         MakeButton(7,ID_FAST,L"⚡ Быстро");MakeButton(8,ID_EXACT,L"◎ Точно");
-        g_noAudio=CreateWindowW(L"BUTTON",L"Экспорт без звука",
-            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,0,0,194,32,
+        g_loadAudio=CreateWindowW(L"BUTTON",L"Загрузить аудио",
+            WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON|WS_TABSTOP,0,0,179,37,
+            hwnd,(HMENU)(INT_PTR)ID_LOAD_AUDIO,GetModuleHandleW(nullptr),nullptr);
+        SendMessageW(g_loadAudio,WM_SETFONT,(WPARAM)g_font,TRUE);
+        g_noAudio=CreateWindowW(L"BUTTON",L"Отключить оригинальный звук",
+            WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,0,0,300,37,
             hwnd,(HMENU)(INT_PTR)ID_NO_AUDIO,GetModuleHandleW(nullptr),nullptr);
-        SendMessageW(g_noAudio,WM_SETFONT,(WPARAM)g_font,TRUE);
         g_time=CreateWindowW(L"STATIC",L"00:00:00 / 00:00:00",WS_CHILD|WS_VISIBLE,0,0,100,20,hwnd,nullptr,nullptr,nullptr);
-        g_status=CreateWindowW(L"STATIC",L"Откройте MP4. Можно перетащить файл в окно.",WS_CHILD|WS_VISIBLE|SS_LEFT,0,0,100,20,hwnd,nullptr,nullptr,nullptr);
+        g_status=CreateWindowW(L"STATIC",L"Откройте MP4. Можно перетащить файл в окно.",WS_CHILD|WS_VISIBLE|SS_LEFT|SS_ENDELLIPSIS,0,0,100,20,hwnd,nullptr,nullptr,nullptr);
         SendMessageW(g_time,WM_SETFONT,(WPARAM)g_font,TRUE);
         SendMessageW(g_status,WM_SETFONT,(WPARAM)g_font,TRUE);
         Relayout();SetTimer(hwnd,1,110,nullptr);return 0;
     }
     case WM_GETMINMAXINFO:{
-        auto p=(MINMAXINFO*)lp;p->ptMinTrackSize.x=930;p->ptMinTrackSize.y=570;return 0;
+        auto p=(MINMAXINFO*)lp;p->ptMinTrackSize.x=960;p->ptMinTrackSize.y=635;return 0;
     }
     case WM_SIZE:Relayout();return 0;
     case WM_DROPFILES:{
@@ -717,51 +738,56 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     }
     case WM_LBUTTONDOWN:{
         POINT p={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
-        if(g_file.empty()||g_exporting)break;
-        if(PtInRect(&g_montageTrack,p)){
-            int index=MontageClipAtX(p.x);
-            if(index>=0){
-                g_dragging=false; // Selecting a clip cancels source-range selection.
-                g_clipMouseDown=true;g_clipDragging=false;
-                g_dragClipIndex=index;g_insertSlot=index;g_mousePt=p;g_selected=index;
-                SetCapture(hwnd);RedrawTrack();return 0;
-            }
-        }
-        if(!PtInRect(&g_track,p))break;
-        g_mouseDown=true;g_dragging=false;g_dragStart=g_dragEnd=PosFromX(p.x);g_mousePt=p;
-        g_cursor=g_dragStart;g_selected=SpanAt(g_cursor);SetCapture(hwnd);RedrawTrack();return 0;
+        if(g_file.empty()||g_exporting)return 0;
+        bool audio=PtInRect(&g_audioTrack,p)!=0;
+        bool video=PtInRect(&g_montageTrack,p)!=0;
+        if(!audio&&!video)break;
+        const auto& clips=audio?g_audioKept:g_kept;
+        RECT row=audio?g_audioTrack:g_montageTrack;
+        int index=ClipAtX(clips,p.x,row);
+        if(index<0)break;
+        g_focusAudio=audio;g_dragAudio=audio;
+        if(audio)g_selectedAudio=index;else g_selected=index;
+        g_dragging=false;g_clipDragging=false;
+        g_clipMouseDown=true;g_dragClipIndex=index;g_insertSlot=index;
+        g_mousePt=p;g_rangeSelect=(GetKeyState(VK_SHIFT)&0x8000)!=0;
+        g_dragStart=g_dragEnd=PositionFromX(p.x);
+        SeekTo(g_dragStart);SetCapture(hwnd);RedrawTrack();return 0;
     }
     case WM_MOUSEMOVE:{
+        if(!g_clipMouseDown)break;
         int x=GET_X_LPARAM(lp);
-        if(g_clipMouseDown){
+        if(g_rangeSelect){
+            if(abs(x-g_mousePt.x)>5)g_dragging=true;
+            g_dragEnd=PositionFromX(x);
+            SeekTo(g_dragEnd);
+        }else{
             if(abs(x-g_mousePt.x)>5)g_clipDragging=true;
-            if(g_clipDragging)g_insertSlot=MontageInsertSlot(x);
-            RedrawTrack();return 0;
+            if(g_clipDragging){
+                const auto& clips=g_dragAudio?g_audioKept:g_kept;
+                RECT row=g_dragAudio?g_audioTrack:g_montageTrack;
+                g_insertSlot=InsertSlot(clips,x,row);
+            }
         }
-        if(!g_mouseDown)break;
-        if(abs(x-g_mousePt.x)>5)g_dragging=true;
-        g_dragEnd=PosFromX(x);g_cursor=g_dragEnd;RedrawTrack();return 0;
+        RedrawTrack();return 0;
     }
     case WM_LBUTTONUP:{
-        if(g_clipMouseDown){
-            int source=g_dragClipIndex,slot=g_insertSlot;
-            bool moved=g_clipDragging;
-            g_clipMouseDown=false;g_clipDragging=false;g_dragClipIndex=-1;
-            ReleaseCapture();
-            if(moved)MoveClip(source,slot);
-            else if(source>=0&&source<(int)g_kept.size())SeekTo(g_kept[source].first);
-            RedrawTrack();return 0;
-        }
-        if(!g_mouseDown)break;
-        g_mouseDown=false;ReleaseCapture();
-        if(!g_dragging){SeekTo(g_dragStart);}
-        else {g_cursor=g_dragEnd;Status(L"Диапазон выделен. Нажмите «Удалить», чтобы вырезать его.");RedrawTrack();}
-        return 0;
+        if(!g_clipMouseDown)break;
+        bool moved=g_clipDragging,range=g_rangeSelect&&g_dragging;
+        int from=g_dragClipIndex,slot=g_insertSlot;bool audio=g_dragAudio;
+        g_clipMouseDown=false;g_clipDragging=false;g_dragClipIndex=-1;
+        ReleaseCapture();
+        if(moved)MoveClip(from,slot,audio);
+        else if(range)Status(L"Диапазон выделен. Нажмите «Удалить», чтобы его вырезать.");
+        else SeekTo(g_dragStart);
+        RedrawTrack();return 0;
     }
     case WM_KEYDOWN:{
         if(wp=='Z'&&(GetKeyState(VK_CONTROL)&0x8000)){Undo();return 0;}
-        if((wp==VK_LEFT||wp==VK_RIGHT)&&(GetKeyState(VK_CONTROL)&0x8000) && g_selected>=0){
-            MoveClip(g_selected,wp==VK_LEFT?g_selected-1:g_selected+2);return 0;
+        if((wp==VK_LEFT||wp==VK_RIGHT)&&(GetKeyState(VK_CONTROL)&0x8000)){
+            int selected=g_focusAudio?g_selectedAudio:g_selected;
+            if(selected>=0)MoveClip(selected,wp==VK_LEFT?selected-1:selected+2,g_focusAudio);
+            return 0;
         }
         if(wp==VK_DELETE){RemoveSelected();return 0;}
         if(wp==VK_SPACE){SendMessageW(hwnd,WM_COMMAND,ID_PLAY,0);return 0;}
@@ -770,15 +796,33 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_COMMAND:{
         switch(LOWORD(wp)){
         case ID_OPEN:{auto p=FileDialog(false);if(!p.empty())OpenFile(p);break;}
+        case ID_LOAD_AUDIO:{auto p=AudioFileDialog();if(!p.empty())OpenAudioFile(p);break;}
+        case ID_NO_AUDIO:
+            g_muteOriginal=!g_muteOriginal;
+            if(g_player)g_player->SetVolume(g_muteOriginal?0.0f:1.0f);
+            InvalidateRect(g_noAudio,nullptr,TRUE);
+            Status(g_muteOriginal?L"Оригинальный звук отключён. Загруженное аудио останется.":L"Оригинальный звук включён.");
+            break;
         case ID_PLAY:
             if(g_player){
-                if(g_playing){if(SUCCEEDED(g_player->Pause()))g_playing=false;}
-                else {if(SUCCEEDED(g_player->Play()))g_playing=true;}
+                if(g_playing){
+                    g_player->Pause();
+                    if(g_audioPlayer)g_audioPlayer->Pause();
+                    g_playing=false;
+                }else{
+                    if(g_cursor>=MontageDuration())SeekTo(0);
+                    if(SUCCEEDED(g_player->Play())){
+                        g_playing=true;
+                        ClipPosition a=LocateClip(g_audioKept,g_cursor);
+                        if(g_audioPlayer&&a.index>=0)g_audioPlayer->Play();
+                    }
+                }
             }break;
         case ID_SPLIT:SplitHere();break;
         case ID_REMOVE:RemoveSelected();break;
         case ID_TRIM_START:if(!g_file.empty()&&!g_exporting)RemoveInterval(0,g_cursor);break;
-        case ID_TRIM_END:if(!g_file.empty()&&!g_exporting)RemoveInterval(g_cursor,g_duration);break;
+        case ID_TRIM_END:if(!g_file.empty()&&!g_exporting)RemoveInterval(g_cursor,
+            g_focusAudio?ClipsDuration(g_audioKept):MontageDuration());break;
         case ID_UNDO:Undo();break;
         case ID_FAST:StartExport(false);break;
         case ID_EXACT:StartExport(true);break;
@@ -786,28 +830,40 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         return 0;
     }
     case WM_TIMER:{
-        if(!g_player||!g_playing||g_file.empty())break;
+        if(!g_player||!g_playing||g_previewClip<0)break;
         PROPVARIANT pos;PropVariantInit(&pos);
         if(SUCCEEDED(g_player->GetPosition(MFP_POSITIONTYPE_100NS,&pos))&&pos.vt==VT_I8){
-            LONGLONG t=pos.hVal.QuadPart;
-            if(t<g_duration){
-                int idx=SpanAt(t);
-                if(idx<0){
-                    auto it=std::min_element(g_kept.begin(),g_kept.end(),[t](Span a,Span b){
-                        const LONGLONG nextA=a.first>t?a.first:LLONG_MAX;
-                        const LONGLONG nextB=b.first>t?b.first:LLONG_MAX;
-                        return nextA<nextB;
-                    });
-                    if(it!=g_kept.end()&&it->first>t)SeekTo(it->first);
-                    else {g_player->Pause();g_playing=false;}
-                }else{
-                    g_cursor=t;
-                    SetWindowTextW(g_time,(TimeLabel(t)+L" / "+TimeLabel(g_duration)).c_str());RedrawTrack();
+            LONGLONG source=pos.hVal.QuadPart;
+            if(g_previewClip<(int)g_kept.size()){
+                Span clip=g_kept[g_previewClip];
+                LONGLONG startOffset=0;
+                for(int i=0;i<g_previewClip;++i)
+                    startOffset+=g_kept[i].last-g_kept[i].first;
+                if(source>=clip.last-HNS/100){
+                    LONGLONG next=startOffset+(clip.last-clip.first);
+                    if(next>=MontageDuration()){
+                        g_player->Pause();
+                        if(g_audioPlayer)g_audioPlayer->Pause();
+                        g_playing=false;g_cursor=MontageDuration();
+                    }else SeekTo(next);
+                }else if(source>=clip.first){
+                    g_cursor=startOffset+source-clip.first;
+                    ClipPosition audio=LocateClip(g_audioKept,g_cursor);
+                    if(audio.index!=g_previewAudioClip){
+                        g_previewAudioClip=audio.index;
+                        if(g_audioPlayer){
+                            if(audio.index>=0){
+                                SetPlayerPosition(g_audioPlayer,audio.source);
+                                g_audioPlayer->Play();
+                            }else g_audioPlayer->Pause();
+                        }
+                    }
                 }
             }
+            SetWindowTextW(g_time,(TimeLabel(g_cursor)+L" / "+TimeLabel(MontageDuration())).c_str());
+            RedrawTrack();
         }
-        PropVariantClear(&pos);
-        return 0;
+        PropVariantClear(&pos);return 0;
     }
     case WM_EXPORT_PROGRESS:
         if(wp==1001){Status(L"Предпросмотр: Media Foundation сообщила об ошибке.");}
@@ -821,6 +877,30 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         else ShowFail(L"Не удалось сохранить MP4",r->message);
         return 0;
     }
+    case WM_DRAWITEM:{
+        DRAWITEMSTRUCT* d=(DRAWITEMSTRUCT*)lp;
+        if(d && d->CtlID==ID_NO_AUDIO){
+            RECT r=d->rcItem;
+            HBRUSH bg=CreateSolidBrush(g_muteOriginal?RGB(32,87,70):RGB(43,54,69));
+            FillRect(d->hDC,&r,bg);DeleteObject(bg);
+            HPEN border=CreatePen(PS_SOLID,2,g_muteOriginal?RGB(97,224,156):RGB(94,115,143));
+            HGDIOBJ oldPen=SelectObject(d->hDC,border);
+            HGDIOBJ oldBrush=SelectObject(d->hDC,GetStockObject(NULL_BRUSH));
+            Rectangle(d->hDC,r.left,r.top,r.right-1,r.bottom-1);
+            SelectObject(d->hDC,oldBrush);SelectObject(d->hDC,oldPen);DeleteObject(border);
+            RECT check={r.left+10,r.top+10,r.left+27,r.top+27};
+            DrawFrameControl(d->hDC,&check,DFC_BUTTON,DFCS_BUTTONCHECK|
+                             (g_muteOriginal?DFCS_CHECKED:0));
+            SetBkMode(d->hDC,TRANSPARENT);SetTextColor(d->hDC,RGB(243,248,253));
+            HFONT previous=(HFONT)SelectObject(d->hDC,g_font);
+            RECT txt={r.left+34,r.top,r.right-6,r.bottom};
+            DrawTextW(d->hDC,L"Отключить оригинальный звук",-1,&txt,
+                      DT_SINGLELINE|DT_VCENTER|DT_LEFT);
+            SelectObject(d->hDC,previous);
+            return TRUE;
+        }
+        break;
+    }
     case WM_PAINT:{
         PAINTSTRUCT ps;HDC dc=BeginPaint(hwnd,&ps);
         RECT client;GetClientRect(hwnd,&client);
@@ -828,7 +908,7 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(219,227,238));
         HFONT previous=(HFONT)SelectObject(dc,g_font);
         RECT title={20,16,client.right-20,45};
-        DrawTextW(dc,L"MiniCut   ·   видео без FFmpeg",-1,&title,DT_SINGLELINE|DT_VCENTER);
+        DrawTextW(dc,L"MiniCut",-1,&title,DT_SINGLELINE|DT_VCENTER);
         if(g_duration){DrawTimeline(dc);}
         SelectObject(dc,previous);EndPaint(hwnd,&ps);return 0;
     }
